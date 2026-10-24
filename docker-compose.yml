@@ -9,6 +9,7 @@ services:
       - "127.0.0.1:8080:8080"    # localhost only; put a reverse proxy with HTTPS in front to share it
     environment:
       GITMIRROR_TOKEN: "${GITMIRROR_TOKEN:-}"                 # setup code for creating your account, and a Bearer token for scripts
+      # GITMIRROR_TRUSTED_PROXIES: "172.18.0.0/16"             # behind a reverse proxy: its address, so clients are told apart
       # GITMIRROR_TOKEN_ROLE: "viewer"                          # make the script token read-only (default: operator)
       GITMIRROR_GITHUB_TOKEN: "${GITMIRROR_GITHUB_TOKEN:-}"   # optional: lifts GitHub's 60 requests/hour limit
       TZ: "${TZ:-UTC}"

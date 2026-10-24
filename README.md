@@ -45,6 +45,7 @@ Open <http://127.0.0.1:8080>. The first visit asks you to create a username and 
 | Setup code and script token | `GITMIRROR_TOKEN`: required once to create the first account, and accepted as `Authorization: Bearer <token>` by scripts such as Home Assistant. Optional but recommended |
 | What the script token may do | `GITMIRROR_TOKEN_ROLE`: `operator` (default) or `viewer` for read-only sensors. It is never an admin |
 | GitHub API token (higher rate limit) | `GITMIRROR_GITHUB_TOKEN`, or the Admin page |
+| Behind a reverse proxy | `GITMIRROR_TRUSTED_PROXIES`: the proxy's address or network (`127.0.0.1`, `172.18.0.0/16`, comma separated). Without it every visitor shares the proxy's address, so the sign-in rate limit locks everyone out together and "last used from" shows the proxy. Only list addresses you control |
 | Port / host / data dir | `GITMIRROR_PORT`, `GITMIRROR_HOST`, `GITMIRROR_DATA` (the image sets `8080`, `0.0.0.0`, `/data`) |
 | Private repos over HTTPS | put a token in the clone URL: `https://user:TOKEN@host/owner/repo.git` (stored in `mirrors.json`, masked in the UI and exports) |
 | Private repos over SSH | mount a key (see the commented line in `docker-compose.yml`) and use `git@host:owner/repo.git` |
@@ -83,10 +84,16 @@ docker compose up -d --build     # rebuilds from the current gitmirror.py; your 
 ### Data layout (`./data`)
 
 ```
-configs/   mirrors.json, sources.json, settings.json, stats.json, history.json, forges.json and one .log per mirror
+configs/   mirrors.json, auth.json (accounts and API key hashes), sessions.json, sources.json, settings.json, stats.json,
+           history.json, audit.json, forges.json, version.json and one .log per mirror
 repos/     <id>.git bare mirrors, <id>.wiki.git wikis
 extras/    <id>/issues.json, releases.json and downloaded release files
+backups/   a copy of configs/ taken automatically before an upgrade changes the data format
 ```
+
+The data folder is made private (mode 700, files 600) because it holds password hashes, API key hashes and tokens that may be part of clone URLs. If a backup tool running as another user has to read it, set `GITMIRROR_PRIVATE_DATA=0`; new files are still written owner-only.
+
+`configs/version.json` records the data format. A gitmirror that finds data written by a *newer* format refuses to start (downgrading could damage it) and tells you so; start the newer version again or restore a backup. `GITMIRROR_IGNORE_SCHEMA=1` overrides that at your own risk.
 
 Back up the whole `data` directory (or just `configs/` plus `repos/`). **Admin > Backup and restore** also exports the list of mirrors and followed accounts as JSON.
 

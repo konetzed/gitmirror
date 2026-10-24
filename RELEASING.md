@@ -27,6 +27,7 @@ Versions follow [semantic versioning](https://semver.org). Whether a version is 
    ```
    CI refuses a `v*` tag that does not match this string.
 3. **Write the changelog.** In `CHANGELOG.md`, move what is under `## [Unreleased]` into a new `## [1.3.0-beta.1] - YYYY-MM-DD` section (keep an empty Unreleased on top), add an "Upgrading" note if anything needs the user to act, and update the link lines at the bottom.
+   If this release changes how data is stored, also raise `SCHEMA_VERSION` in `gitmirror.py` and add a step to `MIGRATIONS`; the old data is backed up automatically before it runs, and an older program will refuse the migrated data.
 4. **Point the examples at it** (optional but tidy): the image tag in `deploy/truenas-scale.yaml` and the example in the README.
 5. **Commit and push `main`:**
    ```bash

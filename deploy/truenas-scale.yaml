@@ -12,6 +12,7 @@ services:
     environment:
       GITMIRROR_TOKEN: "CHANGE-ME-to-a-long-random-string"   # CHANGE: the setup code you enter when creating your account (also a Bearer token for scripts)
       TZ: "UTC"                                              # your time zone, e.g. America/Chicago
+      # GITMIRROR_TRUSTED_PROXIES: "172.16.0.0/12"   # behind a reverse proxy: its address, so clients are told apart
       # GITMIRROR_TOKEN_ROLE: "viewer"   # make the script token read-only (default: operator)
       # GITMIRROR_GITHUB_TOKEN: ""    # optional: lifts GitHub's 60 requests/hour limit
       # Private repos over SSH: put your key at /data/ssh/id_ed25519 (mode 600, owned by the app user), then enable:

@@ -24,7 +24,7 @@ Send SIGHUP (kill -HUP <pid>) to re-exec with the latest code on disk.
 The first visit to the web UI asks you to create a username and password (stored hashed in <data>/configs/auth.json).
 GITMIRROR_TOKEN is optional: it is the setup code for that first account and a Bearer token for scripts ("Authorization: Bearer <token>").
 """
-import argparse, base64, hashlib, hmac, http.cookies, json, os, re, secrets, shutil, signal, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
+import argparse, base64, hashlib, hmac, http.cookies, ipaddress, json, os, re, secrets, shutil, signal, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -106,6 +106,74 @@ def format_interval(mins):
     return out
 
 
+def write_private(path, data, indent=None):
+    """Write JSON atomically with owner-only permissions (these files hold password hashes, keys and clone-URL tokens)."""
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=indent)
+    os.replace(tmp, path)
+
+
+def harden_permissions(data_dir, cfg_dir):
+    """Make the data folder private to the user running gitmirror, and tighten files written by older versions.
+    GITMIRROR_PRIVATE_DATA=0 skips this (for example when a backup tool running as another user has to read the folder)."""
+    if os.name != "posix" or os.environ.get("GITMIRROR_PRIVATE_DATA", "1").lower() in ("0", "false", "no"):
+        return
+    for d in (data_dir, cfg_dir):
+        try:
+            os.chmod(d, 0o700)
+        except OSError:  # not ours to change (a mount owned by someone else): leave it alone
+            pass
+    for f in os.listdir(cfg_dir):
+        if f.endswith((".json", ".log", ".tmp")):
+            try:
+                os.chmod(os.path.join(cfg_dir, f), 0o600)
+            except OSError:
+                pass
+
+
+# ---- data format version: guards against running an older program on newer data, and gives migrations a place to live
+SCHEMA_VERSION = 1
+MIGRATIONS = {}  # {target version: function(store)}; run in order when older data is opened, after a backup of configs/
+
+
+class SchemaTooNew(RuntimeError):
+    pass
+
+
+def check_schema(data_dir, cfg_dir):
+    """The data format version recorded in the folder (0 = written before versions existed, current for a new folder)."""
+    path = os.path.join(cfg_dir, "version.json")
+    stored = None
+    if os.path.exists(path):
+        try:
+            stored = int(load_json(path).get("schema", 0))
+        except (ValueError, TypeError, OSError):
+            stored = 0
+    else:
+        existing = any(os.path.exists(os.path.join(cfg_dir, f)) for f in ("mirrors.json", "auth.json", "settings.json", "sources.json"))
+        stored = 0 if existing else SCHEMA_VERSION
+    if stored > SCHEMA_VERSION and os.environ.get("GITMIRROR_IGNORE_SCHEMA", "0").lower() not in ("1", "true", "yes"):
+        raise SchemaTooNew(f"This data folder was written by a newer gitmirror (data format {stored}; this version understands up to "
+                           f"{SCHEMA_VERSION}). Running an older version on it could damage it. Start the newer version again, or restore a "
+                           f"backup. (GITMIRROR_IGNORE_SCHEMA=1 overrides this at your own risk.)")
+    return stored
+
+
+def migrate_schema(store, stored):
+    if stored >= SCHEMA_VERSION:
+        return
+    backup = os.path.join(store.data, "backups", f"configs-before-format-{SCHEMA_VERSION}-{time.strftime('%Y%m%dT%H%M%S')}")
+    try:
+        shutil.copytree(store.cfg_dir, backup, ignore=shutil.ignore_patterns("*.log", "*.tmp"))
+    except OSError:
+        pass  # a missing backup must not stop the upgrade; the files are only read by the steps below
+    for v in range(stored + 1, SCHEMA_VERSION + 1):
+        if MIGRATIONS.get(v):
+            MIGRATIONS[v](store)
+
+
 class Store:
     def __init__(self, data):
         self.data = os.path.abspath(data)
@@ -114,6 +182,8 @@ class Store:
         self.cfg = os.path.join(self.cfg_dir, "mirrors.json")
         os.makedirs(self.repos_dir, exist_ok=True)
         os.makedirs(self.cfg_dir, exist_ok=True)
+        harden_permissions(self.data, self.cfg_dir)
+        stored_schema = check_schema(self.data, self.cfg_dir)
         self.lock = threading.Lock()
         self.running = set()
         self.settings_path = os.path.join(self.cfg_dir, "settings.json")
@@ -156,19 +226,15 @@ class Store:
         for m in self.mirrors:  # anything "running" at crash time is not running now
             if m.get("status") == "running":
                 m["status"] = "error"
+        migrate_schema(self, stored_schema)
+        write_private(os.path.join(self.cfg_dir, "version.json"),
+                      {"schema": max(stored_schema, SCHEMA_VERSION), "written_by": __version__, "updated": time.time()}, indent=2)
 
     def save(self):
-        tmp = self.cfg + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(self.mirrors, f, indent=2)
-        os.replace(tmp, self.cfg)
+        self._write_private(self.cfg, self.mirrors, indent=2)
 
-    def _write_private(self, path, data):
-        tmp = path + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # password hash and sessions: owner only
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, path)
+    def _write_private(self, path, data, indent=None):
+        write_private(path, data, indent)
 
     def save_auth(self):
         self._write_private(self.auth_path, {"users": self.users})
@@ -180,31 +246,19 @@ class Store:
         self._write_private(self.sessions_path, self.sessions)
 
     def save_sources(self):
-        tmp = self.sources_path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(self.sources, f, indent=2)
-        os.replace(tmp, self.sources_path)
+        self._write_private(self.sources_path, self.sources, indent=2)
 
     def source(self, sid):
         return next((x for x in self.sources if x["id"] == sid), None)
 
     def save_history(self):
-        tmp = self.history_path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(self.history, f)
-        os.replace(tmp, self.history_path)
+        self._write_private(self.history_path, self.history)
 
     def save_stats(self):
-        tmp = self.stats_path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(self.stats, f, indent=2)
-        os.replace(tmp, self.stats_path)
+        self._write_private(self.stats_path, self.stats, indent=2)
 
     def save_settings(self):
-        tmp = self.settings_path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(self.settings, f, indent=2)
-        os.replace(tmp, self.settings_path)
+        self._write_private(self.settings_path, self.settings, indent=2)
 
     def get(self, mid):
         return next((m for m in self.mirrors if m["id"] == mid), None)
@@ -390,8 +444,8 @@ def sync(store, mid):
     try:
         with open(store.logpath(mid), "w") as log:
             try:
-                if not os.path.isdir(repo):
-                    run_git(["clone", "--mirror", "--", src, repo], store.repos_dir, log, timeout)
+                if needs_clone(repo):
+                    clone_mirror(src, repo, store.repos_dir, log, timeout)
                     protect_repo(repo)
                 elif hold:
                     protect_repo(repo)
@@ -760,10 +814,7 @@ def save_forges():
     if not FORGES_PATH:
         return
     with FORGE_LOCK:
-        tmp = FORGES_PATH + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(FORGES, f, indent=2)
-        os.replace(tmp, FORGES_PATH)
+        write_private(FORGES_PATH, FORGES, indent=2)
 
 
 def _probe_get(url):
@@ -1362,7 +1413,7 @@ def delete_mirror(store, mid):
                     k.update(state="excluded", reason="declined", mirror=None)
         store.save()
         store.save_sources()
-    for d in (store.path(mid), store.wiki_path(mid), store.extras_dir(mid)):
+    for d in (store.path(mid), store.wiki_path(mid), store.extras_dir(mid), store.path(mid) + ".partial", store.wiki_path(mid) + ".partial"):
         shutil.rmtree(d, ignore_errors=True)
     try:
         os.remove(store.logpath(mid))
@@ -1397,14 +1448,39 @@ def header_filename(name):
     return re.sub(r"[^A-Za-z0-9._+ -]", "_", str(name).replace("\r", "").replace("\n", ""))[:120] or "download"
 
 
+def needs_clone(repo):
+    """True when there is no usable repository at this path. An empty or stub folder left by an interrupted clone is removed;
+    a damaged repository that still holds objects is left alone (nothing is deleted that might be worth recovering)."""
+    if not os.path.isdir(repo):
+        return True
+    if os.path.exists(os.path.join(repo, "HEAD")):
+        return False
+    for _, _, files in os.walk(os.path.join(repo, "objects")):
+        if files:
+            return False
+    shutil.rmtree(repo, ignore_errors=True)
+    return True
+
+
+def clone_mirror(url, repo, parent, log, timeout):
+    """git clone --mirror into <repo>.partial and rename it when finished, so a crash never leaves a half repository under the real name."""
+    part = repo + ".partial"
+    shutil.rmtree(part, ignore_errors=True)
+    try:
+        run_git(["clone", "--mirror", "--", url, part], parent, log, timeout)
+        os.replace(part, repo)
+    finally:
+        shutil.rmtree(part, ignore_errors=True)
+
+
 def mirror_size(store, mid):
     return sum(dir_size(d) for d in (store.path(mid), store.wiki_path(mid), store.extras_dir(mid)))
 
 
 def mirror_update(repo, url, parent, log, timeout):
     """Create or refresh a bare mirror, pinning anything the origin deleted or rewrote under refs/archive. -> (created, changes)"""
-    if not os.path.isdir(repo):
-        run_git(["clone", "--mirror", "--", url, repo], parent, log, timeout)
+    if needs_clone(repo):
+        clone_mirror(url, repo, parent, log, timeout)
         protect_repo(repo)
         return True, []
     protect_repo(repo)
@@ -1968,6 +2044,46 @@ def version_out(store):
     return out
 
 
+def parse_networks(text):
+    nets = []
+    for part in (text or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            print(f"WARNING: ignoring {part!r} in GITMIRROR_TRUSTED_PROXIES (not an address or network)", file=sys.stderr, flush=True)
+    return nets
+
+
+TRUSTED_PROXIES = parse_networks(os.environ.get("GITMIRROR_TRUSTED_PROXIES", ""))
+
+
+def _addr(text):
+    a = ipaddress.ip_address(text.strip())
+    return a.ipv4_mapped if a.version == 6 and a.ipv4_mapped else a
+
+
+def client_ip(peer, forwarded, trusted):
+    """The address of the real client. X-Forwarded-For is believed only when the connection comes from a trusted proxy, and then
+    the right-most address that is not itself a trusted proxy wins, because anything further left may have been made up by the client."""
+    try:
+        p = _addr(peer)
+    except ValueError:
+        return peer
+    if not any(p in n for n in trusted):
+        return peer
+    for hop in reversed([h for h in (forwarded or "").split(",") if h.strip()]):
+        try:
+            a = _addr(hop)
+        except ValueError:
+            return str(p)  # a garbled chain: don't guess
+        if not any(a in n for n in trusted):
+            return str(a)
+    return str(p)
+
+
 class Handler(BaseHTTPRequestHandler):
     timeout = 30  # seconds a client may stall mid-request before its connection is dropped
     store = None
@@ -1977,6 +2093,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *a):
         pass
+
+    def client_ip(self):
+        return client_ip(self.client_address[0], self.headers.get("X-Forwarded-For"), TRUSTED_PROXIES)
 
     def send(self, code, body, ctype="application/json", headers=None):
         if ctype == "text/html":
@@ -2034,7 +2153,7 @@ class Handler(BaseHTTPRequestHandler):
             ukey, u, k = hit
             if u.get("disabled") or (k.get("expires") and k["expires"] <= now):
                 return None
-            ip = self.client_address[0]
+            ip = self.client_ip()
             if not k.get("last_used") or now - k["last_used"] > KEY_TOUCH_SECS or k.get("last_ip") != ip:
                 with self.store.lock:
                     k["last_used"], k["last_ip"] = now, ip
@@ -2077,7 +2196,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(400, {"error": "body must be a JSON object"})
 
         # ---- sign-in: the only routes that work without being logged in
-        ip = self.client_address[0]
+        ip = self.client_ip()
         self._role, self._audit = "viewer", None
         if method == "GET" and path in ("/login", "/setup"):
             if path == "/login" and self.identity():
@@ -3422,11 +3541,15 @@ def main():
     PAGE, ADMIN, REPO, MAINT, SOURCES, EVENTS, LOGIN, SETUP, ACCOUNT = (x.replace("<style>__STYLE__</style>", THEME_JS + "<style>" + STYLE + "</style>") for x in (PAGE, ADMIN, REPO, MAINT, SOURCES, EVENTS, LOGIN, SETUP, ACCOUNT))
     try:
         Handler.store = Store(a.data)
+    except SchemaTooNew as e:
+        sys.exit(str(e))
     except OSError as e:
         sys.exit(f"gitmirror can't use its data directory ({e.filename or a.data}): {e.strerror}.\n"
                  f"It is running as uid {os.getuid() if hasattr(os, 'getuid') else '?'}. The directory must exist and that user needs read and write access\n"
                  f"(on TrueNAS: make the dataset owned by the app user, uid 568; in Docker: chown the folder to 1000).")
     threading.Thread(target=scheduler, args=(Handler.store,), daemon=True).start()
+    if TRUSTED_PROXIES:
+        print("Trusting X-Forwarded-For from: " + ", ".join(str(n) for n in TRUSTED_PROXIES), flush=True)
     if not Handler.store.users:
         where = f"http://{'localhost' if a.host in ('0.0.0.0', '::') else a.host}:{a.port}/setup"
         print(f"No account yet: open {where} to create the admin account." + (" You will need the GITMIRROR_TOKEN value as the setup code." if API_TOKEN else ""), flush=True)
