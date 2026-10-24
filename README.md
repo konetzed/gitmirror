@@ -27,6 +27,14 @@ Dark theme, with demo data. There are also light, sepia, OLED and high-contrast 
 
 ![A followed account with a new repository and one that vanished](docs/screenshots/source.png)
 
+**Settings and people.** Themes, retry and disk policy, the GitHub token (with a Test token button), and users with viewer, operator and admin roles. Every change by a signed-in user is logged.
+
+![The Admin page](docs/screenshots/admin.png)
+
+**Your account.** Personal API keys for scripts and sensors, each with its own access level, last-used time and expiry, and a password change that signs out other browsers.
+
+![The Account page with an API key](docs/screenshots/account.png)
+
 **Housekeeping.** Disk use over time, integrity checks, the largest and oldest mirrors, and anything that needs LFS.
 
 ![The maintenance page](docs/screenshots/maintenance.png)

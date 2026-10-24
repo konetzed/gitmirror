@@ -4,6 +4,8 @@ All notable changes to gitmirror are listed here, newest first. Versions follow 
 
 ## [Unreleased]
 
+- Docs: refreshed the README screenshots (header with version badge, Account and Log out) and added the Admin and Account pages.
+
 ## [0.1.1] - 2026-10-24
 
 A small, friendly release: you can now check that your GitHub token works, the Admin page says plainly whether one is set, and the TrueNAS instructions are much fuller. No data format change and nothing to do when upgrading.
