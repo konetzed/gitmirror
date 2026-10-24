@@ -4,15 +4,23 @@ All notable changes to gitmirror are listed here, newest first. Versions follow 
 
 ## [Unreleased]
 
+## [0.0.3-beta] - 2026-10-24
+
+### Upgrading
+
+- **Nothing to do for most installs.** On first start the data folder is made private (mode 700, files 600) and `configs/version.json` is written. A copy of your `configs/` is saved to `backups/` first; it is small and safe to delete later.
+- If another user on the machine (a backup tool, say) has to read the data folder, set `GITMIRROR_PRIVATE_DATA=0`.
+- Behind a reverse proxy? Set `GITMIRROR_TRUSTED_PROXIES` to the proxy's address so sign-in limits and "last used from" see the real client.
+- Docker and TrueNAS: change the image tag to `0.0.3-beta`. `latest` does not move for a pre-release and still points at an older build, so use `0.0.3-beta` or `beta`.
+- Data written by this version can be opened by 0.0.2-beta, but only 0.0.3-beta and newer check the new data format version: an older program won't warn you.
+
 ### Added
 
 - **Personal API keys** for scripts and the browser extension: each user can create several keys on the new **Account** page, with a name, an access level (read-only or operator, never admin) and an optional expiry. A key is shown once and stored only as a hash; the page lists when it was created, when and from which address it was last used, and when it expires, and revokes it with one click. A key follows its owner (demoted, disabled or deleted users take their keys with them), can't create keys or change passwords, and is named in the activity log. Admins see key counts and can revoke all of a user's keys.
 - An **Account** page for every user, with the change-password form (it used to be on the Admin page, which only admins can open).
-
-### Added
-
 - **`GITMIRROR_TRUSTED_PROXIES`** for installs behind a reverse proxy. `X-Forwarded-For` is believed only when the connection comes from a listed address, and then only its right-most entry that is not itself a proxy. The sign-in rate limit and "last used from" now see the real client instead of the proxy, so one person's failed attempts no longer lock everyone out.
 - **A data format version** (`configs/version.json`). When a release changes how data is stored, the old data is copied to `backups/` and migrated. A gitmirror that finds data from a newer format refuses to start rather than risk damaging it.
+- **`RELEASING.md`**: version naming, the release steps, and what each tag publishes.
 
 ### Changed
 
@@ -71,6 +79,7 @@ First public release.
 - Light, dark, sepia, OLED and high-contrast themes with a colorblind-safe palette.
 - Docker image for amd64 and arm64 on `ghcr.io/konetzed/gitmirror`, a ready-made TrueNAS SCALE YAML, and GPL-3.0-or-later licensing.
 
-[Unreleased]: https://github.com/konetzed/gitmirror/compare/v0.0.2-beta...HEAD
+[Unreleased]: https://github.com/konetzed/gitmirror/compare/v0.0.3-beta...HEAD
+[0.0.3-beta]: https://github.com/konetzed/gitmirror/compare/v0.0.2-beta...v0.0.3-beta
 [0.0.2-beta]: https://github.com/konetzed/gitmirror/compare/v0.0.1-beta...v0.0.2-beta
 [0.0.1-beta]: https://github.com/konetzed/gitmirror/releases/tag/v0.0.1-beta
