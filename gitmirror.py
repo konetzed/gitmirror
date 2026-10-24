@@ -3227,7 +3227,7 @@ ADMIN = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport
 <label class=cap>...but only if its LFS files total under (GB)<input name=lfs_auto_max_gb type=number min=0 required></label>
 <label class="cap full"><span class=row style="gap:8px"><input type=checkbox name=update_check style="width:auto"> Check GitHub for new gitmirror releases (a version tag lookup every few hours; nothing else is sent)</span><span class=mut id=verline></span></label>
 <label class=cap>Largest release file to download (MB, 0 = list only)<input name=release_asset_max_mb type=number min=0 required></label>
-<label class=cap>GitHub token <span class=mut id=tokstate></span><input name=github_token type=password autocomplete=off placeholder="leave blank to keep"><span class=mut>Lifts the 60 requests/hour limit. Needs no scopes for public data. Never shown again.</span><span class=row style="gap:8px"><button type=button id=tokTest>Test token</button><span class=mut id=tokResult></span></span></label>
+<label class=cap>GitHub token <span id=tokstate></span><input name=github_token type=password autocomplete=off placeholder="leave blank to keep"><span class=mut>Lifts the 60 requests/hour limit. Needs no scopes for public data. Never shown again.</span><span class=row style="gap:8px"><button type=button id=tokTest>Test token</button><span class=mut id=tokResult></span></span></label>
 <label class=cap>Sync timeout (seconds)<input name=timeout type=number min=10 max=86400 required></label>
 <div class="full row"><span class="mut" id=ok></span><span class=sp></span><button class=p>Save</button></div>
 <div class="full err" id=e></div></form></div>
@@ -3247,7 +3247,7 @@ ADMIN = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport
 <div class=mut id=impmsg style="margin-top:6px"></div></div></main>
 <script>
 const api=(p,o={})=>fetch('/api'+p,{...o,headers:{'Content-Type':'application/json'}}).then(r=>{if(r.status==401)location='/login';return r});
-const f=document.querySelector('#f'),show=s=>{if(s.extras_default)document.querySelectorAll('[name=extras_default]').forEach(c=>c.checked=s.extras_default.includes(c.value));document.querySelector('#tokstate').textContent=s.github_token_set?'(set)':'(not set)';f.elements.github_token.value='';for(const k in s){const e=f.elements[k];if(k=='extras_default'||k=='github_token')continue;if(!e)continue;if(e.type=='checkbox')e.checked=!!s[k];else e.value=s[k+'_text']??s[k]}};
+const f=document.querySelector('#f'),show=s=>{if(s.extras_default)document.querySelectorAll('[name=extras_default]').forEach(c=>c.checked=s.extras_default.includes(c.value));{const t=document.querySelector('#tokstate');t.textContent=s.github_token_set?'\u2713 Token Set':'\u2717 No Token Set';t.style.color=s.github_token_set?'var(--ok)':'var(--err)';t.style.fontWeight='700'}f.elements.github_token.value='';for(const k in s){const e=f.elements[k];if(k=='extras_default'||k=='github_token')continue;if(!e)continue;if(e.type=='checkbox')e.checked=!!s[k];else e.value=s[k+'_text']??s[k]}};
 
 api('/settings').then(r=>r.json()).then(show);
 let ME=null;
@@ -3280,7 +3280,7 @@ document.querySelector('#imp').onclick=async()=>{const f=document.querySelector(
  let body;try{body=JSON.parse(await f.text())}catch(e){m.textContent='That file is not valid JSON.';return}
  const r=await api('/import',{method:'POST',body:JSON.stringify(body)}),j=await r.json();
  m.textContent=r.ok?`Added ${j.mirrors_added} mirrors (${j.mirrors_existing} already existed) and ${j.sources_added} followed accounts.${j.skipped.length?' Skipped: '+j.skipped.join('; '):''}`:j.error};
-document.querySelector('#tokTest').onclick=async()=>{const o=document.querySelector('#tokResult');o.textContent='Checking...';try{const r=await api('/github/test',{method:'POST',body:JSON.stringify({token:f.elements.github_token.value})}),j=await r.json();o.textContent=(r.ok?(j.ok?'\u2713 ':'\u2717 ')+j.message:j.error)+(f.elements.github_token.value?' (the typed token, not saved yet)':'')}catch(x){o.textContent='Could not run the test.'}};
+document.querySelector('#tokTest').onclick=async()=>{const o=document.querySelector('#tokResult');o.style.color='';o.textContent='Checking...';try{const r=await api('/github/test',{method:'POST',body:JSON.stringify({token:f.elements.github_token.value})}),j=await r.json();o.style.color=r.ok&&j.ok?'var(--ok)':'var(--err)';o.textContent=(r.ok?(j.ok?'\u2713 ':'\u2717 ')+j.message:j.error)+(f.elements.github_token.value?' (the typed token, not saved yet)':'')}catch(x){o.textContent='Could not run the test.'}};
 f.onsubmit=async e=>{e.preventDefault();const d=Object.fromEntries(new FormData(f));d.timeout=+d.timeout;d.max_parallel=+d.max_parallel;d.release_asset_max_mb=+d.release_asset_max_mb;d.update_check=f.elements.update_check.checked;d.lfs_auto=f.elements.lfs_auto.checked;d.lfs_auto_max_gb=+d.lfs_auto_max_gb;d.extras_default=[...document.querySelectorAll('[name=extras_default]:checked')].map(x=>x.value);if(!d.github_token)delete d.github_token;d.low_disk_gb=+d.low_disk_gb;d.hold_default=f.elements.hold_default.checked;d.colorblind=f.elements.colorblind.checked;
  const r=await api('/settings',{method:'PUT',body:JSON.stringify(d)}),j=await r.json();
  document.querySelector('#e').textContent=r.ok?'':j.error;document.querySelector('#ok').textContent=r.ok?'Saved':'';if(r.ok)show(j)};

@@ -4,6 +4,7 @@ All notable changes to gitmirror are listed here, newest first. Versions follow 
 
 ## [Unreleased]
 
+- The GitHub token field now says "Token Set" (green) or "No Token Set" (red), with a tick or cross for colour-blind readers.
 - Admin has a **Test token** button for the GitHub token: it asks GitHub's rate-limit endpoint (no quota used) whether the saved or just-typed token works, and shows the requests left. The token is never sent back to the browser.
 
 - Docs: a contents line at the top of the README; the TrueNAS section now covers generating the setup code, using personal keys for scripts, and updating with a pinned tag or `pull_policy: always`.
