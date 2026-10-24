@@ -2,6 +2,13 @@
 
 All notable changes to gitmirror are listed here, newest first. Versions follow [semantic versioning](https://semver.org); a `-beta` suffix means the project is still settling and details may change between releases.
 
+## [Unreleased]
+
+### Changed
+
+- **Docker tags now mean something.** `latest` moves only when a *stable* release is tagged (`vX.Y.Z`); it no longer follows every commit or any pre-release. New tags: `edge` (newest commit on `main`), `beta` (newest pre-release) and `1` (newest of a major line), next to `1.2.3`, `1.2` and `sha-<commit>`.
+- The update badge only suggests stable releases to someone running a stable version.
+
 ## [0.0.2-beta] - 2026-10-24
 
 ### Upgrading
@@ -51,5 +58,6 @@ First public release.
 - Light, dark, sepia, OLED and high-contrast themes with a colorblind-safe palette.
 - Docker image for amd64 and arm64 on `ghcr.io/konetzed/gitmirror`, a ready-made TrueNAS SCALE YAML, and GPL-3.0-or-later licensing.
 
+[Unreleased]: https://github.com/konetzed/gitmirror/compare/v0.0.2-beta...HEAD
 [0.0.2-beta]: https://github.com/konetzed/gitmirror/compare/v0.0.1-beta...v0.0.2-beta
 [0.0.1-beta]: https://github.com/konetzed/gitmirror/releases/tag/v0.0.1-beta

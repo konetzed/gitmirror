@@ -77,6 +77,10 @@ class VersionTests(unittest.TestCase):
         self.assertEqual(gm.latest_release(["v0.0.1-beta", "v0.0.10", "v0.0.9", "junk", "latest"]), "0.0.10")
         self.assertEqual(gm.latest_release(["v1.0.0-rc.1", "v1.0.0"]), "1.0.0")
         self.assertIsNone(gm.latest_release(["junk"]))
+        tags = ["v1.0.0", "v1.1.0-beta", "v1.1.0-rc.1"]
+        self.assertEqual(gm.latest_release(tags), "1.1.0-rc.1")
+        self.assertEqual(gm.latest_release(tags, stable_only=True), "1.0.0")
+        self.assertIsNone(gm.latest_release(["v0.0.1-beta"], stable_only=True))
         self.assertIsNone(gm.latest_release([]))
 
 
@@ -295,6 +299,25 @@ class UpdateCheckTests(Base):
             self.assertTrue(self.req("GET", "/api/version", cookie=self.tok)[2]["update_available"])
         finally:
             gm.__version__ = old
+
+    def test_a_stable_install_hears_only_about_stable_releases(self):
+        old, gm.__version__ = gm.__version__, "1.0.0"
+        try:
+            self.store.update_info = {"checked": time.time(), "latest": "1.1.0-beta", "latest_stable": "1.0.0", "error": ""}
+            v = self.req("GET", "/api/version", cookie=self.tok)[2]
+            self.assertEqual((v["update_available"], v["latest"]), (False, "1.0.0"))  # the beta is not offered
+            self.store.update_info = {"checked": time.time(), "latest": "1.1.0-beta", "latest_stable": "1.0.1", "error": ""}
+            v = self.req("GET", "/api/version", cookie=self.tok)[2]
+            self.assertEqual((v["update_available"], v["latest"]), (True, "1.0.1"))
+            self.store.update_info = {"checked": time.time(), "latest": "1.1.0-beta", "latest_stable": None, "error": ""}  # an old record without the field
+            self.assertFalse(self.req("GET", "/api/version", cookie=self.tok)[2]["update_available"])
+        finally:
+            gm.__version__ = old
+
+    def test_a_pre_release_install_hears_about_newer_pre_releases(self):
+        self.store.update_info = {"checked": time.time(), "latest": "99.0.0-beta", "latest_stable": "98.0.0", "error": ""}
+        v = self.req("GET", "/api/version", cookie=self.tok)[2]  # running 0.0.2-beta
+        self.assertEqual((v["update_available"], v["latest"]), (True, "99.0.0-beta"))
 
     def test_can_be_switched_off(self):
         self.store.settings["update_check"] = False

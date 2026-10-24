@@ -1890,10 +1890,12 @@ def version_key(v):
     return (int(m.group(1)), int(m.group(2)), int(m.group(3)), 1 if pre is None else 0, pre or ())
 
 
-def latest_release(tags):
+def latest_release(tags, stable_only=False):
     best = None
     for t in tags:
         k = version_key(t)
+        if k and stable_only and k[3] == 0:  # k[3] is 0 for a pre-release such as 1.0.0-beta
+            continue
         if k and (best is None or k > best[0]):
             best = (k, t.lstrip("v"))
     return best[1] if best else None
@@ -1908,6 +1910,7 @@ def check_update(store):
             raise RuntimeError((p.stderr.strip().splitlines() or ["git ls-remote failed"])[-1][:150])
         tags = [l.split("refs/tags/", 1)[1] for l in p.stdout.splitlines() if "refs/tags/" in l]
         info["latest"] = latest_release(tags)
+        info["latest_stable"] = latest_release(tags, stable_only=True)
     except (OSError, RuntimeError, subprocess.SubprocessError) as e:
         info["error"] = str(e)[:150]
     store.update_info = info
@@ -1918,10 +1921,12 @@ def version_out(store):
     cur, enabled = __version__, bool(store.settings.get("update_check")) and os.environ.get("GITMIRROR_UPDATE_CHECK", "1") not in ("0", "false", "no")
     out = {"version": cur, "enabled": enabled, "repo": REPO_URL}
     if enabled:
-        i = store.update_info
-        newer = bool(i.get("latest")) and (version_key(i["latest"]) or ()) > (version_key(cur) or ())
-        out.update(checked=i.get("checked"), latest=i.get("latest"), update_available=newer, error=i.get("error", ""),
-                   url=f"{REPO_URL}/releases/tag/v{i['latest']}" if i.get("latest") else None)
+        i, ck = store.update_info, version_key(cur)
+        # Someone on a stable release hears only about stable releases; a pre-release install also hears about newer pre-releases.
+        latest = i.get("latest") if (ck is None or ck[3] == 0) else i.get("latest_stable")
+        newer = bool(latest) and (version_key(latest) or ()) > (ck or ())
+        out.update(checked=i.get("checked"), latest=latest, update_available=newer, error=i.get("error", ""),
+                   url=f"{REPO_URL}/releases/tag/v{latest}" if latest else None)
     return out
 
 

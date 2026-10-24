@@ -63,7 +63,16 @@ docker run -d --name gitmirror --restart unless-stopped \
   ghcr.io/konetzed/gitmirror:latest
 ```
 
-Tags: `latest` (newest commit on `main`), `sha-<commit>`, and `1.2.3` / `1.2` for each release tag `v1.2.3`. Pin a version tag if you want updates to happen only when you choose.
+| Tag | What you get |
+|---|---|
+| `1.2.3` | exactly that release, forever. Pin this one |
+| `1.2`, `1` | the newest patch or minor release of that line |
+| `latest` | the newest **stable** release. It never moves for a pre-release or an ordinary commit |
+| `0.3.0-beta` | exactly that pre-release; `beta` is always the newest pre-release |
+| `edge` | the newest commit on `main`: work in progress that may be broken |
+| `sha-<commit>` | the build of one specific commit |
+
+Releases are made by pushing a tag `vX.Y.Z` (or `vX.Y.Z-beta` for a pre-release); a tag without a suffix is a stable release. Until the first stable release exists, `latest` may still point at a beta build, so pin an exact version. The version badge in the page follows the same rule: a stable install is told only about newer stable releases, a pre-release install also hears about newer pre-releases.
 
 ### Updating
 
