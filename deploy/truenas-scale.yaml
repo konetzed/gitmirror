@@ -10,7 +10,7 @@ services:
     ports:
       - "8080:8080"
     environment:
-      GITMIRROR_TOKEN: "CHANGE-ME-to-a-long-random-string"   # CHANGE: protects the web UI and API
+      GITMIRROR_TOKEN: "CHANGE-ME-to-a-long-random-string"   # CHANGE: the setup code you enter when creating your account (also a Bearer token for scripts)
       TZ: "UTC"                                              # your time zone, e.g. America/Chicago
       # GITMIRROR_GITHUB_TOKEN: ""    # optional: lifts GitHub's 60 requests/hour limit
       # Private repos over SSH: put your key at /data/ssh/id_ed25519 (mode 600, owned by the app user), then enable:

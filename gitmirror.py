@@ -21,12 +21,16 @@ Stdlib only (needs git; git-lfs and openssh-client are optional).
 Run:  python3 gitmirror.py [--host 127.0.0.1] [--port 8080] [--data ./data]   (creates <data>/configs, repos and extras)
 The same options can be set with GITMIRROR_HOST, GITMIRROR_PORT and GITMIRROR_DATA.
 Send SIGHUP (kill -HUP <pid>) to re-exec with the latest code on disk.
-Set GITMIRROR_TOKEN to require "Authorization: Bearer <token>" (or ?token=) on every request.
+The first visit to the web UI asks you to create a username and password (stored hashed in <data>/configs/auth.json).
+GITMIRROR_TOKEN is optional: it is the setup code for that first account and a Bearer token for scripts ("Authorization: Bearer <token>").
 """
-import argparse, hmac, json, os, re, shutil, signal, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
+import argparse, base64, hashlib, hmac, http.cookies, json, os, re, secrets, shutil, signal, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+__version__ = "0.0.1-beta"
+REPO_URL = "https://github.com/konetzed/gitmirror"
+API_TOKEN = os.environ.get("GITMIRROR_TOKEN", "")  # optional: setup code for the first account, and a Bearer token for scripts
 URL_RE = re.compile(r"^(https?://|ssh://|git://|file://|[\w.-]+@[\w.-]+:)")
 GIT_ENV = {
     **os.environ,
@@ -37,10 +41,15 @@ GIT_ENV = {
 LOG_KEEP = 20000
 
 
-DEFAULTS = {"lfs_auto": False, "lfs_auto_max_gb": 5, "github_token": "", "low_disk_gb": 5, "fsck_interval": 30 * 24 * 60, "extras_default": ["wiki"], "release_asset_max_mb": 200, "retry_delay": 15, "retry_max": 360, "max_parallel": 4, "hold_default": False, "theme": "auto", "light_theme": "light", "dark_theme": "dark", "colorblind": False, "default_interval": 3 * 24 * 60, "timeout": int(os.environ.get("GITMIRROR_TIMEOUT", "1800"))}
+DEFAULTS = {"update_check": os.environ.get("GITMIRROR_UPDATE_CHECK", "1") not in ("0", "false", "no"), "lfs_auto": False, "lfs_auto_max_gb": 5, "github_token": "", "low_disk_gb": 5, "fsck_interval": 30 * 24 * 60, "extras_default": ["wiki"], "release_asset_max_mb": 200, "retry_delay": 15, "retry_max": 360, "max_parallel": 4, "hold_default": False, "theme": "auto", "light_theme": "light", "dark_theme": "dark", "colorblind": False, "default_interval": 3 * 24 * 60, "timeout": int(os.environ.get("GITMIRROR_TIMEOUT", "1800"))}
 SETTING_RANGES = {"timeout": (10, 86400), "max_parallel": (1, 32), "low_disk_gb": (0, 100000), "release_asset_max_mb": (0, 102400), "lfs_auto_max_gb": (0, 100000)}
 EXTRA_KEYS = ("wiki", "lfs", "releases", "issues")
 CFG = {}  # live reference to Store.settings, for helpers that run outside a Store method
+
+
+def load_json(path, default=None):
+    with open(path) as f:
+        return json.load(f)
 
 
 def parse_interval(v):
@@ -102,25 +111,30 @@ class Store:
         self.settings_path = os.path.join(self.cfg_dir, "settings.json")
         self.settings = dict(DEFAULTS)
         if os.path.exists(self.settings_path):
-            self.settings.update(json.load(open(self.settings_path)))
+            self.settings.update(load_json(self.settings_path))
         CFG.clear()
         CFG["_ref"] = self.settings
         global FORGES_PATH
         FORGES_PATH = os.path.join(self.cfg_dir, "forges.json")
         if os.path.exists(FORGES_PATH):
-            FORGES.update(json.load(open(FORGES_PATH)))
+            FORGES.update(load_json(FORGES_PATH))
         self.stats_path = os.path.join(self.cfg_dir, "stats.json")
         self.stats = {"saved_bytes": 0, "optimized_at": 0}
         if os.path.exists(self.stats_path):
-            self.stats.update(json.load(open(self.stats_path)))
+            self.stats.update(load_json(self.stats_path))
         self.opt = {"active": False}
         self.sources_path = os.path.join(self.cfg_dir, "sources.json")
-        self.sources = json.load(open(self.sources_path)) if os.path.exists(self.sources_path) else []
+        self.sources = load_json(self.sources_path) if os.path.exists(self.sources_path) else []
         self.scanning = set()
+        self.auth_path = os.path.join(self.cfg_dir, "auth.json")
+        self.auth = load_json(self.auth_path) if os.path.exists(self.auth_path) else {}
+        self.sessions_path = os.path.join(self.cfg_dir, "sessions.json")
+        self.sessions = load_json(self.sessions_path) if os.path.exists(self.sessions_path) else {}
+        self.update_info = {"checked": 0, "latest": None, "error": ""}
         self.heartbeat = time.time()
         self.history_path = os.path.join(self.cfg_dir, "history.json")
-        self.history = json.load(open(self.history_path)) if os.path.exists(self.history_path) else []
-        self.mirrors = json.load(open(self.cfg)) if os.path.exists(self.cfg) else []
+        self.history = load_json(self.history_path) if os.path.exists(self.history_path) else []
+        self.mirrors = load_json(self.cfg) if os.path.exists(self.cfg) else []
         for m in self.mirrors:  # anything "running" at crash time is not running now
             if m.get("status") == "running":
                 m["status"] = "error"
@@ -130,6 +144,19 @@ class Store:
         with open(tmp, "w") as f:
             json.dump(self.mirrors, f, indent=2)
         os.replace(tmp, self.cfg)
+
+    def _write_private(self, path, data):
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # password hash and sessions: owner only
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+
+    def save_auth(self):
+        self._write_private(self.auth_path, self.auth)
+
+    def save_sessions(self):
+        self._write_private(self.sessions_path, self.sessions)
 
     def save_sources(self):
         tmp = self.sources_path + ".tmp"
@@ -639,6 +666,11 @@ def scheduler(store):
                     store.save_history()
         except OSError:
             pass
+        ui = store.update_info
+        if (store.settings.get("update_check") and os.environ.get("GITMIRROR_UPDATE_CHECK", "1") not in ("0", "false", "no")
+                and now - ui.get("checked", 0) >= (3600 if ui.get("error") else 6 * 3600)):
+            store.update_info = dict(ui, checked=now)  # claim the slot so a slow check isn't started twice
+            threading.Thread(target=check_update, args=(store,), daemon=True).start()
         stopped = disk_info(store)["stopped"]
         with store.lock:
             room = 0 if stopped else store.settings["max_parallel"] - len(store.running)
@@ -1536,7 +1568,7 @@ def sync_issues(store, mid, src, log, prev):
     kind, api = fr
     path = os.path.join(ed, "issues.json")
     try:
-        db = json.load(open(path))
+        db = load_json(path)
     except (OSError, ValueError):
         db = {"since": None, "issues": {}}
     since = db.get("since")
@@ -1648,10 +1680,143 @@ def check_url(u, label):
         raise ValueError(f"{label}: must be an http(s)://, ssh://, git://, file:// or user@host:path URL")
 
 
+# ---- accounts, sessions, login throttling
+SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 15, 8, 1
+SESSION_SECS = 30 * 24 * 3600
+USER_RE = re.compile(r"^[A-Za-z0-9_.@+-]{1,64}$")
+LOGIN_WINDOW, LOGIN_MAX, LOGIN_MAX_ALL = 600, 8, 60
+LOGIN_FAILS = {}
+
+
+def _b64(b):
+    return base64.b64encode(b).decode()
+
+
+def hash_password(pw, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P):
+    salt = os.urandom(16)
+    h = hashlib.scrypt(pw.encode(), salt=salt, n=n, r=r, p=p, maxmem=128 * n * r * 2 + (1 << 20), dklen=32)
+    return f"scrypt${n}${r}${p}${_b64(salt)}${_b64(h)}"
+
+
+def verify_password(pw, stored):
+    try:
+        scheme, n, r, p, salt, want = stored.split("$")
+        n, r, p = int(n), int(r), int(p)
+        if scheme != "scrypt" or n > 2 ** 17 or r > 16 or p > 4 or n < 2 or n & (n - 1):
+            return False
+        got = hashlib.scrypt(pw.encode(), salt=base64.b64decode(salt), n=n, r=r, p=p, maxmem=128 * n * r * 2 + (1 << 20), dklen=32)
+        return hmac.compare_digest(got, base64.b64decode(want))
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def check_new_credentials(username, password):
+    if not isinstance(username, str) or not USER_RE.match(username):
+        raise ValueError("Username: 1 to 64 letters, digits or . _ @ + -")
+    check_new_password(password)
+
+
+def check_new_password(password):
+    if not isinstance(password, str) or not 8 <= len(password) <= 256:
+        raise ValueError("Password must be 8 to 256 characters")
+
+
+def login_wait(ip):
+    """Seconds this client must wait before another attempt (0 = go ahead)."""
+    now = time.time()
+    mine = [t for t in LOGIN_FAILS.get(ip, []) if now - t < LOGIN_WINDOW]
+    LOGIN_FAILS[ip] = mine
+    allf = [t for lst in LOGIN_FAILS.values() for t in lst]
+    if len(mine) >= LOGIN_MAX:
+        return int(LOGIN_WINDOW - (now - mine[0])) + 1
+    if len(allf) >= LOGIN_MAX_ALL:
+        return int(LOGIN_WINDOW - (now - min(allf))) + 1
+    return 0
+
+
+def login_failed(ip):
+    LOGIN_FAILS.setdefault(ip, []).append(time.time())
+    if len(LOGIN_FAILS) > 2000:  # never let a flood of addresses grow this without bound
+        for k in [k for k, v in LOGIN_FAILS.items() if not v or time.time() - v[-1] > LOGIN_WINDOW]:
+            LOGIN_FAILS.pop(k, None)
+
+
+def new_session(store, user, agent=""):
+    tok = secrets.token_urlsafe(32)
+    now = time.time()
+    with store.lock:
+        store.sessions = {h: s for h, s in store.sessions.items() if s["exp"] > now}
+        store.sessions[hashlib.sha256(tok.encode()).hexdigest()] = {"user": user, "created": now, "exp": now + SESSION_SECS, "agent": agent[:80]}
+        store.save_sessions()
+    return tok
+
+
+def session_user(store, tok):
+    h, now = hashlib.sha256(tok.encode()).hexdigest(), time.time()
+    with store.lock:
+        s = store.sessions.get(h)
+        if not s or s["exp"] <= now:
+            return None
+        if s["exp"] - now < SESSION_SECS - 5 * 24 * 3600:  # slide the expiry, but write the file at most every few days
+            s["exp"] = now + SESSION_SECS
+            store.save_sessions()
+        return s["user"]
+
+
+def end_sessions(store, keep=None):
+    with store.lock:
+        store.sessions = {h: s for h, s in store.sessions.items() if h == keep}
+        store.save_sessions()
+
+
+# ---- version and update check
+def version_key(v):
+    """Sortable form of a semantic version such as 1.2.3 or v0.0.1-beta (a pre-release sorts before its release)."""
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+.*)?", str(v).strip())
+    if not m:
+        return None
+    pre = tuple((0, int(i), "") if i.isdigit() else (1, 0, i) for i in m.group(4).split(".")) if m.group(4) else None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), 1 if pre is None else 0, pre or ())
+
+
+def latest_release(tags):
+    best = None
+    for t in tags:
+        k = version_key(t)
+        if k and (best is None or k > best[0]):
+            best = (k, t.lstrip("v"))
+    return best[1] if best else None
+
+
+def check_update(store):
+    """Ask GitHub which version tags exist (git ls-remote: no API quota, no login). Never raises."""
+    info = {"checked": time.time(), "latest": None, "error": ""}
+    try:
+        p = subprocess.run(["git", "ls-remote", "--tags", "--refs", REPO_URL + ".git"], env=GIT_ENV, capture_output=True, text=True, timeout=30)
+        if p.returncode:
+            raise RuntimeError((p.stderr.strip().splitlines() or ["git ls-remote failed"])[-1][:150])
+        tags = [l.split("refs/tags/", 1)[1] for l in p.stdout.splitlines() if "refs/tags/" in l]
+        info["latest"] = latest_release(tags)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+        info["error"] = str(e)[:150]
+    store.update_info = info
+    return info
+
+
+def version_out(store):
+    cur, enabled = __version__, bool(store.settings.get("update_check")) and os.environ.get("GITMIRROR_UPDATE_CHECK", "1") not in ("0", "false", "no")
+    out = {"version": cur, "enabled": enabled, "repo": REPO_URL}
+    if enabled:
+        i = store.update_info
+        newer = bool(i.get("latest")) and (version_key(i["latest"]) or ()) > (version_key(cur) or ())
+        out.update(checked=i.get("checked"), latest=i.get("latest"), update_available=newer, error=i.get("error", ""),
+                   url=f"{REPO_URL}/releases/tag/v{i['latest']}" if i.get("latest") else None)
+    return out
+
+
 class Handler(BaseHTTPRequestHandler):
     timeout = 30  # seconds a client may stall mid-request before its connection is dropped
     store = None
-    token = os.environ.get("GITMIRROR_TOKEN", "")
     server_version = "gitmirror"
 
     def log_message(self, *a):
@@ -1668,24 +1833,48 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype + "; charset=utf-8")
         self.send_header("Content-Length", str(len(b)))
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-store")
         for k, v in (headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(b)
 
-    def authed(self):
-        if not self.token:
-            return True
-        q = parse_qs(urlparse(self.path).query)
-        given = (self.headers.get("Authorization") or "").removeprefix("Bearer ") if self.headers.get("Authorization", "").startswith("Bearer ") else (q.get("token") or [""])[0]
-        return hmac.compare_digest(given.encode(), self.token.encode())
+    def redirect(self, url):
+        self.send_response(302)
+        self.send_header("Location", url)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def cookie(self, name):
+        try:
+            c = http.cookies.SimpleCookie()
+            c.load(self.headers.get("Cookie", ""))
+        except http.cookies.CookieError:
+            return None
+        m = c.get(name)
+        return m.value if m else None
+
+    def session_header(self, tok):
+        secure = "; Secure" if self.headers.get("X-Forwarded-Proto", "").lower() == "https" else ""
+        age = SESSION_SECS if tok else 0
+        return {"Set-Cookie": f"gm_session={tok or ''}; Path=/; HttpOnly; SameSite=Strict; Max-Age={age}{secure}"}
+
+    def identity(self):
+        """('token', None) for the Bearer token, ('session', name) for a logged-in browser, or None."""
+        ah = self.headers.get("Authorization") or ""
+        if API_TOKEN and ah.startswith("Bearer ") and hmac.compare_digest(ah[7:].encode(), API_TOKEN.encode()):
+            return ("token", None)
+        tok = self.cookie("gm_session")
+        user = session_user(self.store, tok) if tok else None
+        return ("session", user) if user else None
 
     def route(self, method):
-        if urlparse(self.path).path == "/healthz":  # for Docker / uptime checks, so it needs no token
+        if urlparse(self.path).path == "/healthz":  # for Docker / uptime checks, so it needs no login
             ok = time.time() - self.store.heartbeat < 90 and os.access(self.store.data, os.W_OK)
-            return self.send(200 if ok else 503, {"ok": ok})
-        if not self.authed():
-            return self.send(401, {"error": "unauthorized"})
+            return self.send(200 if ok else 503, {"ok": ok, "version": __version__})
         path = urlparse(self.path).path.rstrip("/") or "/"
         st = self.store
         if method != "GET":  # CSRF: browsers can't send JSON content-type cross-origin without preflight
@@ -1708,6 +1897,94 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(400, {"error": "bad json"})
             if not isinstance(body, dict):
                 return self.send(400, {"error": "body must be a JSON object"})
+
+        # ---- sign-in: the only routes that work without being logged in
+        ip = self.client_address[0]
+        if method == "GET" and path in ("/login", "/setup"):
+            if path == "/login" and self.identity():
+                return self.redirect("/")
+            if (path == "/setup") != (not st.auth):
+                return self.redirect("/setup" if not st.auth else "/login")
+            return self.send(200, LOGIN if path == "/login" else SETUP, "text/html")
+        if method == "GET" and path == "/api/auth/status":
+            return self.send(200, {"setup_required": not st.auth, "setup_code_required": bool(API_TOKEN) and not st.auth})
+        if method == "POST" and path == "/api/auth/setup":
+            wait = login_wait(ip)
+            if wait:
+                return self.send(429, {"error": f"Too many attempts. Try again in {wait} seconds."}, headers={"Retry-After": str(wait)})
+            if st.auth:
+                return self.send(403, {"error": "An account already exists. Sign in instead."})
+            if API_TOKEN and not hmac.compare_digest(str(body.get("setup_code", "")).encode(), API_TOKEN.encode()):
+                login_failed(ip)
+                return self.send(403, {"error": "Wrong setup code. It is the GITMIRROR_TOKEN value the server was started with."})
+            try:
+                name, pw = body.get("username"), body.get("password")
+                check_new_credentials(name, pw)
+            except ValueError as e:
+                return self.send(400, {"error": str(e)})
+            digest = hash_password(pw)
+            with st.lock:
+                if st.auth:
+                    return self.send(409, {"error": "An account was just created. Sign in instead."})
+                st.auth = {"user": name, "hash": digest, "created": time.time()}
+                st.save_auth()
+            return self.send(200, {"ok": True}, headers=self.session_header(new_session(st, name, self.headers.get("User-Agent", ""))))
+        if method == "POST" and path == "/api/auth/login":
+            if not st.auth:
+                return self.send(409, {"error": "No account yet. Open /setup first."})
+            wait = login_wait(ip)
+            if wait:
+                return self.send(429, {"error": f"Too many failed attempts. Try again in {wait} seconds."}, headers={"Retry-After": str(wait)})
+            name, pw = body.get("username"), body.get("password")
+            name, pw = (name if isinstance(name, str) else ""), (pw if isinstance(pw, str) else "")
+            pw_ok = verify_password(pw[:256], st.auth["hash"])  # always run the slow hash, so timing doesn't reveal a wrong user name
+            user_ok = hmac.compare_digest(name.casefold().encode(), st.auth["user"].casefold().encode())
+            if not (pw_ok and user_ok):
+                login_failed(ip)
+                return self.send(401, {"error": "Wrong username or password."})
+            LOGIN_FAILS.pop(ip, None)
+            return self.send(200, {"ok": True}, headers=self.session_header(new_session(st, st.auth["user"], self.headers.get("User-Agent", ""))))
+
+        ident = self.identity()
+        if not ident:
+            if method == "GET" and not path.startswith(("/api/", "/dl/")):
+                return self.redirect("/setup" if not st.auth else "/login")
+            return self.send(401, {"error": "unauthorized", "setup_required": not st.auth})
+        if method == "POST" and path == "/api/auth/logout":
+            tok = self.cookie("gm_session")
+            if tok:
+                with st.lock:
+                    st.sessions.pop(hashlib.sha256(tok.encode()).hexdigest(), None)
+                    st.save_sessions()
+            return self.send(200, {"ok": True}, headers=self.session_header(None))
+        if method == "GET" and path == "/api/auth/me":
+            return self.send(200, {"user": ident[1], "via": ident[0]})
+        if method == "POST" and path == "/api/auth/password":
+            if ident[0] != "session":
+                return self.send(403, {"error": "Change the password from a signed-in browser."})
+            wait = login_wait(ip)
+            if wait:
+                return self.send(429, {"error": f"Too many failed attempts. Try again in {wait} seconds."}, headers={"Retry-After": str(wait)})
+            cur, new = body.get("current"), body.get("new")
+            if not isinstance(cur, str) or not verify_password(cur[:256], st.auth["hash"]):
+                login_failed(ip)
+                return self.send(403, {"error": "Current password is wrong."})
+            try:
+                check_new_password(new)
+            except ValueError as e:
+                return self.send(400, {"error": str(e)})
+            digest = hash_password(new)
+            with st.lock:
+                st.auth["hash"] = digest
+                st.save_auth()
+            end_sessions(st)  # every other browser has to sign in again
+            return self.send(200, {"ok": True}, headers=self.session_header(new_session(st, ident[1], self.headers.get("User-Agent", ""))))
+        if method == "GET" and path == "/api/version":
+            return self.send(200, version_out(st))
+        if method == "POST" and path == "/api/version/check":
+            if version_out(st)["enabled"]:
+                check_update(st)
+            return self.send(200, version_out(st))
 
         if method == "GET" and path == "/":
             return self.send(200, PAGE, "text/html")
@@ -1745,6 +2022,8 @@ class Handler(BaseHTTPRequestHandler):
                     new["hold_default"] = bool(body["hold_default"])
                 if "lfs_auto" in body:
                     new["lfs_auto"] = bool(body["lfs_auto"])
+                if "update_check" in body:
+                    new["update_check"] = bool(body["update_check"])
                 for k, (lo, hi) in SETTING_RANGES.items():
                     if k in body:
                         v = int(body[k])
@@ -2123,11 +2402,11 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET" and act == "extras":
                 ed, out = st.extras_dir(mid), {"state": m.get("extras_state", {}), "releases": [], "issues": []}
                 try:
-                    out["releases"] = json.load(open(os.path.join(ed, "releases.json")))
+                    out["releases"] = load_json(os.path.join(ed, "releases.json"))
                 except (OSError, ValueError):
                     pass
                 try:
-                    iss = sorted(json.load(open(os.path.join(ed, "issues.json")))["issues"].values(), key=lambda i: -i["number"])
+                    iss = sorted(load_json(os.path.join(ed, "issues.json"))["issues"].values(), key=lambda i: -i["number"])
                     out["issues"], out["issues_total"] = iss[:500], len(iss)
                 except (OSError, ValueError, KeyError):
                     pass
@@ -2221,6 +2500,7 @@ th{color:var(--mut);font-weight:500;white-space:nowrap}td.n{white-space:nowrap}.
 .tgl .kn{position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:var(--card);box-shadow:0 1px 3px #0006;transition:transform .2s}
 .tgl input:checked~.kn{transform:translateX(28px)}.tgl input:focus-visible~.tr{outline:2px solid var(--acc);outline-offset:2px}
 select{width:100%;padding:8px;border:1px solid var(--bd);border-radius:6px;background:var(--bg);color:var(--fg);margin-top:4px}
+.brand{color:inherit;text-decoration:none}.brand:hover{text-decoration:underline}
 .chip{display:inline-block;padding:1px 9px;border-radius:999px;border:1px solid var(--bd);font-size:12px;background:var(--bg);cursor:pointer}
 .chip.on{background:var(--acc);border-color:var(--acc);color:var(--onacc)}.chip b{margin-left:4px;opacity:.6}
 dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 16px;margin:0}dt{color:var(--mut)}dd{margin:0;word-break:break-word}
@@ -2230,9 +2510,9 @@ dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 16px;margin:0}dt{c
 PAGE = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Git Mirror</title>
 <style>__STYLE__</style>
-<main><div class=row style="position:relative"><h1>Git Mirror</h1><span class=sp></span><a data-nav href="/events">Events</a><a data-nav href="/sources">Sources</a><a data-nav href="/maintenance">Maintenance</a><a data-nav href="/admin">Admin</a>
+<main><div class=row style="position:relative"><h1><a class=brand href="https://github.com/konetzed/gitmirror" target=_blank rel="noopener noreferrer" title="gitmirror on GitHub">Git Mirror</a></h1><span class=mut id=ver></span><span class=sp></span><a data-nav href="/events">Events</a><a data-nav href="/sources">Sources</a><a data-nav href="/maintenance">Maintenance</a><a data-nav href="/admin">Admin</a>
 <button class=icon id=thbtn title="Theme options" aria-haspopup=true aria-expanded=false>🎨</button>
-<label class=tgl title="Light / dark"><input type=checkbox id=themetgl aria-label="Dark mode"><span class=tr><span>☀</span><span>☾</span></span><span class=kn></span></label>
+<label class=tgl title="Light / dark"><input type=checkbox id=themetgl aria-label="Dark mode"><span class=tr><span>☀</span><span>☾</span></span><span class=kn></span></label><a href="#" id=logout>Log out</a>
 <div class=pop id=thpop hidden>
 <label class=cap>☀ Sun (light) theme<select id=thl><option value=light>Light</option><option value=sepia>Sepia</option><option value=hc-light>High contrast light</option></select></label>
 <label class=cap>☾ Moon (dark) theme<select id=thd><option value=dark>Dark</option><option value=oled>OLED black</option><option value=hc-dark>High contrast dark</option></select></label>
@@ -2259,11 +2539,10 @@ PAGE = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport 
 <div id=list></div></main>
 <script>
 const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const tok=new URLSearchParams(location.search).get('token');
-const api=(p,o={})=>fetch('/api'+p+(tok?(p.includes('?')?'&':'?')+'token='+encodeURIComponent(tok):''),{...o,headers:{'Content-Type':'application/json'}});
+const api=(p,o={})=>fetch('/api'+p,{...o,headers:{'Content-Type':'application/json'}}).then(r=>{if(r.status==401)location='/login';return r});
 const ago=t=>{if(!t)return'never';const s=Date.now()/1e3-t;return s<90?Math.round(s)+'s ago':s<5400?Math.round(s/60)+'m ago':s<172800?Math.round(s/3600)+'h ago':Math.round(s/86400)+'d ago'};
 const sz=b=>b==null?'':b>1e9?(b/1e9).toFixed(1)+' GB':b>1e6?(b/1e6).toFixed(1)+' MB':Math.round(b/1e3)+' KB';
-const open=new Set();let busy=false,filter=(new URLSearchParams(location.search).get('tag')||'').toLowerCase()||null;const Q=tok?'?token='+encodeURIComponent(tok):'';
+const open=new Set();let busy=false,filter=(new URLSearchParams(location.search).get('tag')||'').toLowerCase()||null;
 const post=(p,b)=>api(p,{method:'POST',body:JSON.stringify(b||{})});
 const bytes=b=>!b?'0 B':b>=1e9?(b/1e9).toFixed(1)+' GB':b>=1e6?(b/1e6).toFixed(1)+' MB':b>=1e3?Math.round(b/1e3)+' KB':b+' B';
 async function loadStats(){const r=await api('/stats');if(!r.ok)return;const s=await r.json();
@@ -2288,17 +2567,17 @@ function render(){let ms=cache.slice();
  shown=ms.map(m=>m.id);
  $('#count').textContent=ms.length==cache.length?cache.length+' mirrors':ms.length+' of '+cache.length+' mirrors';
  $('#list').innerHTML=ms.map(m=>{const st=m.running?'running':m.status,mt=m.meta||{};return `<div class=card data-id=${m.id}>
- <div class=row><input type=checkbox class=sel style="width:auto" aria-label="Select ${esc(m.name)}" ${selected.has(m.id)?'checked':''}><span class="dot ${st}"></span><b><a href="/repo/${m.id}${Q}">${esc(m.name)}</a></b>${mt.web_url?` <a class=mut href="${esc(mt.web_url)}" target=_blank rel="noopener noreferrer">origin ↗</a>`:''}${m.source_name?` <a class=mut href="/source/${m.source_id}${Q}">from ${esc(m.source_name)}</a>`:''}<span class=sp></span>
+ <div class=row><input type=checkbox class=sel style="width:auto" aria-label="Select ${esc(m.name)}" ${selected.has(m.id)?'checked':''}><span class="dot ${st}"></span><b><a href="/repo/${m.id}">${esc(m.name)}</a></b>${mt.web_url?` <a class=mut href="${esc(mt.web_url)}" target=_blank rel="noopener noreferrer">origin ↗</a>`:''}${m.source_name?` <a class=mut href="/source/${m.source_id}">from ${esc(m.source_name)}</a>`:''}<span class=sp></span>
  <button data-a=sync ${m.running?'disabled':''}>Sync now</button><button data-a=toggle>${m.enabled?'Pause':'Resume'}</button><button data-a=hold title="Hold upstream rewrites and deletions for review instead of applying them">${m.hold?'Hold: on':'Hold: off'}</button>
  <button data-a=log>Log</button><button data-a=del>Delete</button><button data-a=edit>Edit</button></div>
  ${mt.description?`<div>${esc(mt.description)}</div>`:''}
  <div class=mut>${esc(m.source)}</div>
  ${(m.tags||[]).length?`<div class=row style="margin-top:4px">${m.tags.map(t=>`<span class=chip data-tag="${esc(t.toLowerCase())}">${esc(t)}</span>`).join('')}</div>`:''}
  <div class=mut>${m.enabled?(m.interval?'every '+m.interval_text:'manual'):'paused'} · last run ${ago(m.last_run)}${m.duration!=null?' ('+m.duration+'s)':''} · ${sz(m.size)}${m.next_run&&!m.running?' · next '+until(m.next_run):''}</div>
- ${m.held_count?`<div style="color:var(--run)">⏸ ${m.held_count} upstream change(s) on hold <a href="/repo/${m.id}${Q}">review</a></div>`:''}
+ ${m.held_count?`<div style="color:var(--run)">⏸ ${m.held_count} upstream change(s) on hold <a href="/repo/${m.id}">review</a></div>`:''}
  ${m.lfs_needed?`<div style="color:var(--run)">⚠ Uses Git LFS (${m.lfs_detect.files==1?'1 file':(m.lfs_detect.files??'some')+' files'}${m.lfs_detect.bytes?', '+sz(m.lfs_detect.bytes):''}) but the large files aren't being mirrored. ${m.lfs_detect.installed===false?'git-lfs is not installed on this server.':'<button data-a=lfs>Enable LFS</button>'}</div>`:''}
  ${m.failures?`<div class=mut>failed ${m.failures}× in a row${m.retry_at?', retrying '+until(m.retry_at):''}</div>`:''}
- ${m.alert?`<div class=err>⚠ ${esc(m.alert)} <a href="/repo/${m.id}${Q}">details</a></div>`:''}
+ ${m.alert?`<div class=err>⚠ ${esc(m.alert)} <a href="/repo/${m.id}">details</a></div>`:''}
  ${m.error?`<div class=err>${esc(m.error)}</div>`:''}
  ${open.has(m.id)?'<pre id=log-'+m.id+'>…</pre>':''}</div>`}).join('')||'<p class=mut>'+(cache.length?'No mirrors match.':'No mirrors yet.')+'</p>';
  for(const id of open){const el=$('#log-'+id);if(el)api('/mirrors/'+id+'/log').then(r=>r.text()).then(t=>el.textContent=t||'(empty)')}
@@ -2318,14 +2597,22 @@ $('#q').oninput=e=>{qtext=e.target.value;render()};
 $('#sortby').value=sortby;$('#sortby').onchange=e=>{sortby=e.target.value;try{localStorage.setItem('gm-sort',sortby)}catch(x){}render()};
 document.onclick=e=>{const c=e.target.closest('.chip');if(!c)return;const k=c.dataset.tag;filter=filter==k?null:k;render()};
 $('#list').onclick=async e=>{const b=e.target.closest('button');if(!b)return;const id=b.closest('.card').dataset.id,a=b.dataset.a;
- if(a=='edit'){location='/repo/'+id+Q;return}
+ if(a=='edit'){location='/repo/'+id;return}
  if(a=='log'){open.has(id)?open.delete(id):open.add(id)}
  else if(a=='del'){if(!confirm('Delete mirror and its local copy?'))return;const r=await api('/mirrors/'+id,{method:'DELETE'});if(!r.ok)alert((await r.json()).error)}
  else await api('/mirrors/'+id+'/'+a,{method:'POST'});load()};
 $('#f').onsubmit=async e=>{e.preventDefault();const d=Object.fromEntries(new FormData(e.target));d.hold=e.target.elements.hold.checked;
  const r=await api('/mirrors',{method:'POST',body:JSON.stringify(d)});
  if(r.ok){e.target.reset();$('#e').textContent='';load()}else{const j=await r.json();
-  if(r.status==422&&j.account_url){$('#e').textContent=j.error;setTimeout(()=>location='/sources?add='+encodeURIComponent(j.account_url)+(tok?'&token='+encodeURIComponent(tok):''),1200)}else $('#e').textContent=j.error}};
+  if(r.status==422&&j.account_url){$('#e').textContent=j.error;setTimeout(()=>location='/sources?add='+encodeURIComponent(j.account_url),1200)}else $('#e').textContent=j.error}};
+$('#logout').onclick=async e=>{e.preventDefault();await fetch('/api/auth/logout',{method:'POST',headers:{'Content-Type':'application/json'}});location='/login'};
+async function loadVer(){const v=await (await api('/version')).json(),el=$('#ver');
+ if(!v.enabled){el.textContent='v'+v.version;return}
+ if(!v.checked){el.textContent='v'+v.version+' · checking for updates…';setTimeout(loadVer,8000);return}
+ if(v.update_available)el.innerHTML='v'+esc(v.version)+' · <a href="'+esc(v.url)+'" target=_blank rel="noopener noreferrer">update available: v'+esc(v.latest)+'</a>';
+ else if(v.latest)el.textContent='v'+v.version+' · up to date ✓';
+ else el.textContent='v'+v.version+(v.error?' · could not check for updates':'')}
+loadVer();
 const tg=$('#themetgl'),pop=$('#thpop');
 const sync=()=>{const s=GM.apply();tg.checked=s.mode=='dark';$('#thl').value=s.L;$('#thd').value=s.K;$('#thcb').checked=s.cb};sync();
 tg.onchange=()=>{GM.set('theme',tg.checked?'dark':'light');sync()};
@@ -2336,7 +2623,7 @@ $('#thbtn').onclick=e=>{e.stopPropagation();pop.hidden=!pop.hidden;e.currentTarg
 pop.onclick=e=>e.stopPropagation();
 document.addEventListener('click',()=>{pop.hidden=true;$('#thbtn').setAttribute('aria-expanded','false')});
 document.addEventListener('keydown',e=>{if(e.key=='Escape'){pop.hidden=true;$('#thbtn').focus()}});
-document.querySelectorAll('a[data-nav]').forEach(a=>a.href=a.getAttribute('href')+Q);
+
 api('/settings').then(r=>r.json()).then(s=>{const i=document.querySelector('[name=interval]');i.defaultValue=i.value=s.default_interval_text;const h=document.querySelector('[name=hold]');h.defaultChecked=h.checked=!!s.hold_default});
 load();setInterval(load,3000);
 </script></html>"""
@@ -2363,27 +2650,40 @@ ADMIN = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport
 <label class=row style="gap:4px"><input type=checkbox style="width:auto" name=extras_default value=issues> Issues</label></div></div>
 <label class="cap full"><span class=row style="gap:8px"><input type=checkbox name=lfs_auto style="width:auto"> Turn on Git LFS archiving automatically when a repo uses it</span></label>
 <label class=cap>...but only if its LFS files total under (GB)<input name=lfs_auto_max_gb type=number min=0 required></label>
+<label class="cap full"><span class=row style="gap:8px"><input type=checkbox name=update_check style="width:auto"> Check GitHub for new gitmirror releases (a version tag lookup every few hours; nothing else is sent)</span><span class=mut id=verline></span></label>
 <label class=cap>Largest release file to download (MB, 0 = list only)<input name=release_asset_max_mb type=number min=0 required></label>
 <label class=cap>GitHub token <span class=mut id=tokstate></span><input name=github_token type=password autocomplete=off placeholder="leave blank to keep"><span class=mut>Lifts the 60 requests/hour limit. Needs no scopes for public data. Never shown again.</span></label>
 <label class=cap>Sync timeout (seconds)<input name=timeout type=number min=10 max=86400 required></label>
 <div class="full row"><span class="mut" id=ok></span><span class=sp></span><button class=p>Save</button></div>
 <div class="full err" id=e></div></form></div>
+<div class=card><b>Account</b> <span class=mut id=whoami></span>
+<form id=pf style="margin-top:8px">
+<label class=cap>Current password<input type=password name=current autocomplete=current-password required></label>
+<label class=cap>New password (8 or more characters)<input type=password name=new autocomplete=new-password minlength=8 required></label>
+<label class=cap>Repeat the new password<input type=password name=again autocomplete=new-password minlength=8 required></label>
+<div class="full row"><span class=mut id=pmsg></span><span class=sp></span><button class=p>Change password</button></div><div class="full err" id=perr></div></form>
+<div class=mut>Changing the password signs out every other browser. Lost it? Stop gitmirror, delete <code>configs/auth.json</code> in the data folder and start it again to create a new account.</div></div>
 <div class=card><b>Backup and restore the mirror list</b>
 <div class=mut style="margin:2px 0 8px">Exports the list of mirrors and followed accounts (not the repository data). Credentials inside clone URLs are masked, so those entries can't be restored from the file.</div>
 <div class=row><a id=exp href="/api/export" download><button type=button>Download export</button></a><input type=file id=impf accept=".json,application/json" style="width:auto"><button id=imp>Import</button></div>
 <div class=mut id=impmsg style="margin-top:6px"></div></div></main>
 <script>
-const tok=new URLSearchParams(location.search).get('token');
-const api=(p,o={})=>fetch('/api'+p+(tok?'?token='+encodeURIComponent(tok):''),{...o,headers:{'Content-Type':'application/json'}});
+const api=(p,o={})=>fetch('/api'+p,{...o,headers:{'Content-Type':'application/json'}}).then(r=>{if(r.status==401)location='/login';return r});
 const f=document.querySelector('#f'),show=s=>{if(s.extras_default)document.querySelectorAll('[name=extras_default]').forEach(c=>c.checked=s.extras_default.includes(c.value));document.querySelector('#tokstate').textContent=s.github_token_set?'(set)':'(not set)';f.elements.github_token.value='';for(const k in s){const e=f.elements[k];if(k=='extras_default'||k=='github_token')continue;if(!e)continue;if(e.type=='checkbox')e.checked=!!s[k];else e.value=s[k+'_text']??s[k]}};
-document.querySelector('a').href='/'+(tok?'?token='+encodeURIComponent(tok):'');
+
 api('/settings').then(r=>r.json()).then(show);
-document.querySelector('#exp').href='/api/export'+(tok?'?token='+encodeURIComponent(tok):'');
+api('/auth/me').then(r=>r.json()).then(m=>{if(m.user)document.querySelector('#whoami').textContent='signed in as '+m.user});
+api('/version').then(r=>r.json()).then(v=>{document.querySelector('#verline').textContent='This is v'+v.version+(v.enabled&&v.latest?(v.update_available?'; v'+v.latest+' is available.':'; that is the newest release.'):'')});
+document.querySelector('#pf').onsubmit=async ev=>{ev.preventDefault();const g=ev.target.elements,pe=document.querySelector('#perr'),pm=document.querySelector('#pmsg');pe.textContent='';pm.textContent='';
+ if(g.new.value!==g.again.value){pe.textContent='The two new passwords differ.';return}
+ const r=await api('/auth/password',{method:'POST',body:JSON.stringify({current:g.current.value,new:g.new.value})}),j=await r.json();
+ if(r.ok){pm.textContent='Password changed';ev.target.reset()}else pe.textContent=j.error};
+
 document.querySelector('#imp').onclick=async()=>{const f=document.querySelector('#impf').files[0],m=document.querySelector('#impmsg');if(!f){m.textContent='Choose an export file first.';return}
  let body;try{body=JSON.parse(await f.text())}catch(e){m.textContent='That file is not valid JSON.';return}
  const r=await api('/import',{method:'POST',body:JSON.stringify(body)}),j=await r.json();
  m.textContent=r.ok?`Added ${j.mirrors_added} mirrors (${j.mirrors_existing} already existed) and ${j.sources_added} followed accounts.${j.skipped.length?' Skipped: '+j.skipped.join('; '):''}`:j.error};
-f.onsubmit=async e=>{e.preventDefault();const d=Object.fromEntries(new FormData(f));d.timeout=+d.timeout;d.max_parallel=+d.max_parallel;d.release_asset_max_mb=+d.release_asset_max_mb;d.lfs_auto=f.elements.lfs_auto.checked;d.lfs_auto_max_gb=+d.lfs_auto_max_gb;d.extras_default=[...document.querySelectorAll('[name=extras_default]:checked')].map(x=>x.value);if(!d.github_token)delete d.github_token;d.low_disk_gb=+d.low_disk_gb;d.hold_default=f.elements.hold_default.checked;d.colorblind=f.elements.colorblind.checked;
+f.onsubmit=async e=>{e.preventDefault();const d=Object.fromEntries(new FormData(f));d.timeout=+d.timeout;d.max_parallel=+d.max_parallel;d.release_asset_max_mb=+d.release_asset_max_mb;d.update_check=f.elements.update_check.checked;d.lfs_auto=f.elements.lfs_auto.checked;d.lfs_auto_max_gb=+d.lfs_auto_max_gb;d.extras_default=[...document.querySelectorAll('[name=extras_default]:checked')].map(x=>x.value);if(!d.github_token)delete d.github_token;d.low_disk_gb=+d.low_disk_gb;d.hold_default=f.elements.hold_default.checked;d.colorblind=f.elements.colorblind.checked;
  const r=await api('/settings',{method:'PUT',body:JSON.stringify(d)}),j=await r.json();
  document.querySelector('#e').textContent=r.ok?'':j.error;document.querySelector('#ok').textContent=r.ok?'Saved':'';if(r.ok)show(j)};
 </script></html>"""
@@ -2411,15 +2711,14 @@ REPO = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport 
 <div class=card><b>Last sync log</b><pre id=log>…</pre></div></main>
 <script>
 const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const tok=new URLSearchParams(location.search).get('token'),Q=tok?'?token='+encodeURIComponent(tok):'';
 const id=location.pathname.split('/').pop();
-const api=(p,o={})=>fetch('/api'+p+(tok?(p.includes('?')?'&':'?')+'token='+encodeURIComponent(tok):''),{...o,headers:{'Content-Type':'application/json'}});
+const api=(p,o={})=>fetch('/api'+p,{...o,headers:{'Content-Type':'application/json'}}).then(r=>{if(r.status==401)location='/login';return r});
 const when=t=>t?new Date(t*1000).toLocaleString():'—';
 const ago=t=>{if(!t)return'never';const s=Date.now()/1e3-t;return s<90?Math.round(s)+'s ago':s<5400?Math.round(s/60)+'m ago':s<172800?Math.round(s/3600)+'h ago':Math.round(s/86400)+'d ago'};
 const until=t=>{const s=t-Date.now()/1e3;return s<=30?'due now':s<5400?'in '+Math.max(1,Math.round(s/60))+'m':s<172800?'in '+Math.round(s/3600)+'h':'in '+Math.round(s/86400)+'d'};
 const sz=b=>b==null?'—':b>1e9?(b/1e9).toFixed(1)+' GB':b>1e6?(b/1e6).toFixed(1)+' MB':Math.round(b/1e3)+' KB';
 const link=u=>`<a href="${esc(u)}" target=_blank rel="noopener noreferrer">${esc(u)}</a>`;
-$('#back').href='/'+Q;
+$('#back').href='/';
 let m=null,tags=[];
 function render(){const mt=m.meta||{},g=m.git||{},st=m.running?'running':m.status;
  document.title=m.name+' · Git Mirror';$('#title').textContent=m.name;
@@ -2460,7 +2759,7 @@ function render(){const mt=m.meta||{},g=m.git||{},st=m.running?'running':m.statu
  api('/mirrors/'+id+'/log').then(r=>r.text()).then(t=>$('#log').textContent=t||'(empty)')}
 function renderTags(){$('#tags').innerHTML=tags.map((t,i)=>`<span class=chip data-i=${i}>${esc(t)}<b>×</b></span>`).join('')||'<span class=mut>No tags yet.</span>'}
 async function load(first){const r=await api('/mirrors/'+id);
- if(r.status==404){document.body.innerHTML=`<main><p>Mirror not found. <a href="/${Q}">Back to all mirrors</a></p></main>`;return}
+ if(r.status==404){document.body.innerHTML=`<main><p>Mirror not found. <a href="/">Back to all mirrors</a></p></main>`;return}
  if(!r.ok)return;m=await r.json();render();
  if(first){tags=[...(m.tags||[])];renderTags();$('#nm').value=m.name;$('#iv').value=m.interval_text}}
 async function saveTags(){const r=await api('/mirrors/'+id,{method:'PUT',body:JSON.stringify({tags})}),j=await r.json();
@@ -2481,7 +2780,7 @@ async function loadExtras(){const sig=JSON.stringify(m.extras_state||{})+JSON.st
  h+=line('releases',S('releases').state=='ok'?`Releases: ${S('releases').count} saved, ${S('releases').downloaded} new files downloaded${S('releases').skipped?', '+S('releases').skipped+' skipped (size limit or failed)':''}, ${sz(S('releases').bytes)} on disk`:S('releases').state=='error'?'Releases: '+esc(S('releases').msg):'Releases: not fetched yet');
  h+=line('issues',S('issues').state=='ok'?`Issues: ${S('issues').count} saved${S('issues').msg?' ('+esc(S('issues').msg)+')':''}`:S('issues').state=='error'?'Issues: '+esc(S('issues').msg):'Issues: not fetched yet');
  if((j.releases||[]).length)h+=`<details style="margin-top:8px"><summary><b>Releases (${j.releases.length})</b></summary>${j.releases.map(r=>`<details style="margin:6px 0 6px 12px"><summary>${esc(r.tag)}${r.name&&r.name!=r.tag?' · '+esc(r.name):''}${r.prerelease?' <span class=chip style="cursor:default">pre-release</span>':''} <span class=mut>${esc((r.published||'').slice(0,10))}</span></summary>
-  ${r.body?`<pre>${esc(r.body)}</pre>`:''}${(r.assets||[]).map(a=>`<div>${a.local?`<a href="/dl/${id}/${a.local.split('/').map(encodeURIComponent).join('/')}${Q}">${esc(a.name)}</a>`:esc(a.name)} <span class=mut>${a.size!=null?sz(a.size):''} ${a.local?'':esc(a.note||'')}</span></div>`).join('')}</details>`).join('')}</details>`;
+  ${r.body?`<pre>${esc(r.body)}</pre>`:''}${(r.assets||[]).map(a=>`<div>${a.local?`<a href="/dl/${id}/${a.local.split('/').map(encodeURIComponent).join('/')}">${esc(a.name)}</a>`:esc(a.name)} <span class=mut>${a.size!=null?sz(a.size):''} ${a.local?'':esc(a.note||'')}</span></div>`).join('')}</details>`).join('')}</details>`;
  if((j.issues||[]).length)h+=`<details style="margin-top:8px"><summary><b>Issues (${j.issues_total}${j.issues_total>j.issues.length?', newest '+j.issues.length+' shown':''})</b></summary>${j.issues.map(i=>`<details style="margin:6px 0 6px 12px"><summary>#${i.number} ${esc(i.title)} <span class=mut>${esc(i.state)}${i.is_pr?' · PR':''} · ${(i.comments||[]).length} comments</span></summary>
   <div class=mut>${esc(i.author||'?')} opened ${esc((i.created||'').slice(0,10))}${i.url?` · <a href="${esc(i.url)}" target=_blank rel="noopener noreferrer">origin ↗</a>`:''}</div>${i.body?`<pre>${esc(i.body)}</pre>`:''}
   ${(i.comments||[]).map(c=>`<div style="margin:6px 0 0 12px"><span class=mut>${esc(c.author||'?')} · ${esc((c.created||'').slice(0,10))}</span><pre>${esc(c.body||'')}</pre></div>`).join('')}</details>`).join('')}</details>`;
@@ -2498,7 +2797,7 @@ $('#f').onsubmit=async e=>{e.preventDefault();
  $('#fmsg').textContent=r.ok?'Saved':j.error;if(r.ok){$('#iv').value=j.interval_text;load()}};
 document.querySelector('.card .row').onclick=async e=>{const b=e.target.closest('button');if(!b)return;const a=b.dataset.a;
  if(a=='del'){if(!confirm('Delete mirror and its local copy?'))return;const r=await api('/mirrors/'+id,{method:'DELETE'});
-  if(r.ok)location='/'+Q;else $('#err').textContent=(await r.json()).error;return}
+  if(r.ok)location='/';else $('#err').textContent=(await r.json()).error;return}
  b.disabled=true;const r=await api('/mirrors/'+id+'/'+a,{method:'POST'});b.disabled=false;
  if(a=='meta'&&r.ok){const j=await r.json(),e=(j.meta||{}).fetch_error;
   $('#amsg').textContent=j.changed==null?'No API details available for this host.':e?'Lookup failed, kept previous details: '+e:j.changed.length?'Updated from origin: '+j.changed.join(', '):'Checked origin just now: nothing has changed.'}
@@ -2516,8 +2815,7 @@ MAINT = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport
 <div id=lists></div></main>
 <script>
 const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const tok=new URLSearchParams(location.search).get('token'),Q=tok?'?token='+encodeURIComponent(tok):'';
-const api=(p,o={})=>fetch('/api'+p+(tok?(p.includes('?')?'&':'?')+'token='+encodeURIComponent(tok):''),{...o,headers:{'Content-Type':'application/json'}});
+const api=(p,o={})=>fetch('/api'+p,{...o,headers:{'Content-Type':'application/json'}}).then(r=>{if(r.status==401)location='/login';return r});
 const bytes=b=>!b?'0 B':b>=1e9?(b/1e9).toFixed(1)+' GB':b>=1e6?(b/1e6).toFixed(1)+' MB':b>=1e3?Math.round(b/1e3)+' KB':b+' B';
 const day=t=>t?new Date(t*1000).toLocaleDateString():'unknown';
 const ago=t=>{if(!t)return'never';const s=Date.now()/1e3-t;return s<5400?Math.round(s/60)+'m ago':s<172800?Math.round(s/3600)+'h ago':Math.round(s/86400)+'d ago'};
@@ -2526,16 +2824,16 @@ const kinds={size:['Largest mirrors','Biggest disk users first. Delete or optimi
  lfs:['LFS not mirrored','These repos use Git LFS but their large files are not being archived. Enable LFS to protect them.'],
  attention:['Needs attention','Failing syncs, missing origins, alerts and paused mirrors: candidates for cleanup.']};
 const only=location.pathname.split('/')[2]||null;
-$('#back').href=only?'/maintenance'+Q:'/'+Q;$('#back').textContent=only?'Back to maintenance':'All mirrors';
+$('#back').href=only?'/maintenance':'/';$('#back').textContent=only?'Back to maintenance':'All mirrors';
 if(only){$('#title').textContent=kinds[only][0];document.title=kinds[only][0]+' · Git Mirror'}
 const status=m=>m.origin_missing?'<span class=err>origin missing</span>':m.status=='error'?'<span class=err>error</span>':esc(m.status)+(m.enabled?'':' (paused)');
 const table=rows=>rows.length?`<div class=scroll><table><tr><th>Name</th><th>Added</th><th>Last good sync</th><th>Size</th><th>Status</th><th>Tags</th><th></th></tr>${rows.map(m=>`<tr data-id=${m.id}>
- <td><a href="/repo/${m.id}${Q}">${esc(m.name)}</a>${m.lfs_needed&&m.lfs_detect?` <span class=mut>LFS: ${m.lfs_detect.files==1?'1 file':(m.lfs_detect.files??'?')+' files'}, ${bytes(m.lfs_detect.bytes)}</span>`:''}</td><td class=n>${day(m.added)}</td><td class=n>${ago(m.last_ok)}</td><td class=n>${bytes(m.size)}</td><td>${status(m)}</td>
+ <td><a href="/repo/${m.id}">${esc(m.name)}</a>${m.lfs_needed&&m.lfs_detect?` <span class=mut>LFS: ${m.lfs_detect.files==1?'1 file':(m.lfs_detect.files??'?')+' files'}, ${bytes(m.lfs_detect.bytes)}</span>`:''}</td><td class=n>${day(m.added)}</td><td class=n>${ago(m.last_ok)}</td><td class=n>${bytes(m.size)}</td><td>${status(m)}</td>
  <td>${(m.tags||[]).map(t=>`<span class=chip style="cursor:default">${esc(t)}</span>`).join(' ')}</td>
  <td class=n>${m.lfs_needed?'<button data-a=lfs>Enable LFS</button> ':''}<button data-a=opt>Optimize</button> <button data-a=del>Delete</button></td></tr>`).join('')}</table></div>`:'<p class=mut>Nothing here.</p>';
 async function loadLists(){const ks=only?[only]:Object.keys(kinds);
  const res=await Promise.all(ks.map(k=>api('/maintenance?kind='+k+(only?'':'&limit=10')).then(r=>r.json())));
- $('#lists').innerHTML=ks.map((k,i)=>(!only&&k=='lfs'&&!res[i].total)?'':`<div class=card><div class=row><b>${esc(kinds[k][0])}</b>${only?` <span class=mut>(${res[i].total})</span>`:''}<span class=sp></span>${!only&&res[i].total>10?`<a href="/maintenance/${k}${Q}">View full list (${res[i].total}) →</a>`:''}</div>
+ $('#lists').innerHTML=ks.map((k,i)=>(!only&&k=='lfs'&&!res[i].total)?'':`<div class=card><div class=row><b>${esc(kinds[k][0])}</b>${only?` <span class=mut>(${res[i].total})</span>`:''}<span class=sp></span>${!only&&res[i].total>10?`<a href="/maintenance/${k}">View full list (${res[i].total}) →</a>`:''}</div>
   <div class=mut style="margin:2px 0 8px">${esc(kinds[k][1])}${only?'':' Top 10.'}</div>${table(res[i].rows)}</div>`).join('')}
 async function loadStats(){const r=await api('/stats');if(!r.ok)return;const s=await r.json(),o=s.optimize||{};
  $('#top').innerHTML='<div class=tiles>'+[[s.projects,'projects'],[bytes(s.disk_bytes),'disk space used'],[bytes(s.saved_bytes),'space saved by optimizing'],[s.disk_free==null?'?':bytes(s.disk_free),'free on the data disk'+(s.low_disk?' (low)':'')],[s.optimized_at?ago(s.optimized_at):'never','last optimized']].map(t=>`<div class=card><b>${t[0]}</b><span>${t[1]}</span></div>`).join('')+'</div>';
@@ -2570,15 +2868,14 @@ SOURCES = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewpo
 <div id=view></div></main>
 <script>
 const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const tok=new URLSearchParams(location.search).get('token'),Q=tok?'?token='+encodeURIComponent(tok):'';
-const api=(p,o={})=>fetch('/api'+p+(tok?(p.includes('?')?'&':'?')+'token='+encodeURIComponent(tok):''),{...o,headers:{'Content-Type':'application/json'}});
+const api=(p,o={})=>fetch('/api'+p,{...o,headers:{'Content-Type':'application/json'}}).then(r=>{if(r.status==401)location='/login';return r});
 const post=(p,b)=>api(p,{method:'POST',body:JSON.stringify(b||{})});
 const kb=n=>n==null?'?':n>=1048576?(n/1048576).toFixed(1)+' GB':n>=1024?(n/1024).toFixed(1)+' MB':n+' KB';
 const ago=t=>{if(!t)return'never';const s=Date.now()/1e3-t;return s<90?Math.round(s)+'s ago':s<5400?Math.round(s/60)+'m ago':s<172800?Math.round(s/3600)+'h ago':Math.round(s/86400)+'d ago'};
 const EX=[['wiki','Wiki'],['lfs','Git LFS files'],['releases','Releases'],['issues','Issues']];
 const exBoxes=(sel,name)=>EX.map(e=>`<label class=row style="gap:4px;font-size:13px"><input type=checkbox style="width:auto" name="${name}" value=${e[0]} ${sel.includes(e[0])?'checked':''}> ${e[1]}</label>`).join(' ');
 const parts=location.pathname.split('/').filter(Boolean),sid=parts[0]=='source'?parts[1]:null;
-$('#back').href=sid?'/sources'+Q:'/'+Q;$('#back').textContent=sid?'All sources':'All mirrors';
+$('#back').href=sid?'/sources':'/';$('#back').textContent=sid?'All sources':'All mirrors';
 let preview=null;
 
 /* ---------- list page ---------- */
@@ -2588,8 +2885,8 @@ async function list(){
   <div class=mut style="margin:2px 0 8px">Paste an account page, e.g. https://github.com/name. You'll choose which repositories to mirror before anything is added.</div>
   <form id=pf class=row style="flex-wrap:nowrap"><input id=purl placeholder="https://github.com/name" required><button class=p>Preview</button></form><div class=err id=perr></div></div>
   <div id=prev></div>
-  ${ss.map(x=>`<div class=card><div class=row><b><a href="/source/${x.id}${Q}">${esc(x.name)}</a></b><span class=mut>${esc(x.kind)} ${esc(x.account_type)} · ${esc(x.hostport)}</span><span class=sp></span>
-   <a href="/${Q.replace('?','?')}${Q?'&':'?'}tag=${encodeURIComponent(x.name.toLowerCase())}">view mirrors</a></div>
+  ${ss.map(x=>`<div class=card><div class=row><b><a href="/source/${x.id}">${esc(x.name)}</a></b><span class=mut>${esc(x.kind)} ${esc(x.account_type)} · ${esc(x.hostport)}</span><span class=sp></span>
+   <a href="/?tag=${encodeURIComponent(x.name.toLowerCase())}">view mirrors</a></div>
    <div class=mut>${x.counts.added} mirrored · ${x.counts.pending?`<b style="color:var(--run)">${x.counts.pending} waiting for approval</b>`:'0 waiting'} · ${x.counts.excluded} skipped · ${x.counts.gone?`<span class=err>${x.counts.gone} gone from account</span>`:'0 gone'} · scanned ${ago(x.last_scan)}${x.last_error?` · <span class=err>${esc(x.last_error)}</span>`:''}</div>
    ${x.alert?`<div class=err>⚠ ${esc(x.alert)}</div>`:''}</div>`).join('')||'<p class=mut>No sources yet.</p>'}`;
  $('#pf').onsubmit=async e=>{e.preventDefault();$('#perr').textContent='';$('#prev').innerHTML='<p class=mut>Looking up the account…</p>';
@@ -2599,7 +2896,7 @@ async function list(){
  const u=new URLSearchParams(location.search).get('add');if(u){$('#purl').value=u;$('#pf').requestSubmit()}
 }
 function renderPreview(){const j=preview,a=j.account;
- if(j.source_id){$('#prev').innerHTML=`<div class=card>You already follow this account. <a href="/source/${j.source_id}${Q}">Open it</a>.</div>`;return}
+ if(j.source_id){$('#prev').innerHTML=`<div class=card>You already follow this account. <a href="/source/${j.source_id}">Open it</a>.</div>`;return}
  const tot=j.repos.reduce((n,r)=>n+(r.size_kb||0),0);
  $('#prev').innerHTML=`<div class=card><div class=row><b>${esc(a.name)}</b><span class=mut>${esc(a.kind)} ${esc(a.type)} · ${j.repos.length} repositories · ${j.repos.filter(r=>r.fork).length} fork${j.repos.filter(r=>r.fork).length==1?'':'s'} · ${j.repos.filter(r=>r.arch).length} archived · about ${kb(tot)} on the host</span></div>
   <div class=scroll><table><tr><th><input type=checkbox id=all style="width:auto"></th><th>Repository</th><th>Size</th><th>Stars</th><th></th></tr>
@@ -2621,7 +2918,7 @@ function renderPreview(){const j=preview,a=j.account;
   const body={url:j.url,selected:boxes().filter(b=>b.checked).map(b=>j.repos[b.dataset.i].path),interval:f.interval.value,tags:f.tags.value,
    extras:[...document.querySelectorAll('#cf [name=extras]:checked')].map(x=>x.value),hold:f.hold.checked,auto_add:f.auto_add.checked,include_forks:f.include_forks.checked};
   $('#cerr').textContent='';const r=await post('/sources',body),k=await r.json();
-  if(r.ok)location='/source/'+k.id+Q;else $('#cerr').textContent=k.error}}
+  if(r.ok)location='/source/'+k.id;else $('#cerr').textContent=k.error}}
 
 /* ---------- detail page ---------- */
 async function detail(){
@@ -2633,14 +2930,14 @@ async function detail(){
  const pend=rows('pending'),gone=rows('gone'),skip=rows('excluded');
  $('#view').innerHTML=`
  <div class=card><div class=row><span class=mut>${esc(x.kind)} ${esc(x.account_type)} · ${esc(x.hostport)} · scanned ${ago(x.last_scan)} · rescans every ${esc(x.rescan_text)}</span><span class=sp></span>
-  <a href="/${Q}${Q?'&':'?'}tag=${encodeURIComponent(x.name.toLowerCase())}">view mirrors on main page</a><button id=rescan>Rescan now</button><button id=del>Remove source</button></div>
+  <a href="/?tag=${encodeURIComponent(x.name.toLowerCase())}">view mirrors on main page</a><button id=rescan>Rescan now</button><button id=del>Remove source</button></div>
   ${x.last_error?`<div class=err>${esc(x.last_error)}</div>`:''}${x.alert?`<div class=row><span class=err>⚠ ${esc(x.alert)}</span><button id=ack>Dismiss</button></div>`:''}</div>
  ${pend.length?`<div class=card style="border-color:var(--run)"><div class=row><b>⏸ ${pend.length} new repositor${pend.length==1?'y':'ies'} waiting for approval</b><span class=sp></span><button class=p id=appall>Mirror all</button></div>
   <div class=scroll><table>${pend.map(([p,k])=>`<tr data-p="${esc(p)}"><td><b>${esc(k.name)}</b>${k.arch?' <span class=chip style="cursor:default">archived</span>':''}<div class=mut>${esc(k.desc||'')}</div></td><td class=n>${kb(k.size_kb)}</td><td class=n><button data-a=approve>Mirror</button> <button data-a=skip>Skip</button></td></tr>`).join('')}</table></div></div>`:''}
  ${gone.length?`<div class=card style="border-color:var(--err)"><b class=err>${gone.length} no longer in the account</b><div class=mut>Still mirrored and kept as archives.</div>
-  <div class=scroll><table>${gone.map(([p,k])=>`<tr><td><a href="/repo/${k.mirror}${Q}">${esc(k.name)}</a></td><td class=mut>${esc(p)}</td></tr>`).join('')}</table></div></div>`:''}
+  <div class=scroll><table>${gone.map(([p,k])=>`<tr><td><a href="/repo/${k.mirror}">${esc(k.name)}</a></td><td class=mut>${esc(p)}</td></tr>`).join('')}</table></div></div>`:''}
  <div class=card><b>Mirrored (${mine.length})</b><div class=scroll><table><tr><th>Name</th><th>Status</th><th>Last good sync</th><th>Size</th><th>Tags</th></tr>
-  ${mine.map(m=>`<tr><td><a href="/repo/${m.id}${Q}">${esc(m.name)}</a></td><td>${m.status=='error'?'<span class=err>error</span>':esc(m.status)}${m.gone_from_source?' <span class=err>gone</span>':''}</td><td class=n>${ago(m.last_ok)}</td><td class=n>${m.size!=null?kb(Math.round(m.size/1024)):'—'}</td><td>${(m.tags||[]).map(t=>`<span class=chip style="cursor:default">${esc(t)}</span>`).join(' ')}</td></tr>`).join('')||'<tr><td class=mut>Nothing mirrored yet.</td></tr>'}</table></div></div>
+  ${mine.map(m=>`<tr><td><a href="/repo/${m.id}">${esc(m.name)}</a></td><td>${m.status=='error'?'<span class=err>error</span>':esc(m.status)}${m.gone_from_source?' <span class=err>gone</span>':''}</td><td class=n>${ago(m.last_ok)}</td><td class=n>${m.size!=null?kb(Math.round(m.size/1024)):'—'}</td><td>${(m.tags||[]).map(t=>`<span class=chip style="cursor:default">${esc(t)}</span>`).join(' ')}</td></tr>`).join('')||'<tr><td class=mut>Nothing mirrored yet.</td></tr>'}</table></div></div>
  <div class=card><b>Settings for this source</b><form id=sf style="margin-top:8px">
   <label class=cap>Interval for new repositories<input name=interval value="${esc(x.interval_text)}"></label>
   <label class=cap>Rescan the account every (0 = manual)<input name=rescan value="${esc(x.rescan_text)}"></label>
@@ -2656,7 +2953,7 @@ async function detail(){
  $('#rescan').onclick=async()=>{$('#rescan').disabled=true;await post('/sources/'+sid+'/rescan');setTimeout(detail,2500)};
  $('#del').onclick=async()=>{const all=confirm('Remove this source?\n\nOK = remove the source only; its mirrors stay and keep syncing.\nCancel = go back.');if(!all)return;
   const del=confirm('Also delete the '+mine.length+' mirrors it created and their local copies?\n\nOK = delete them too. Cancel = keep the mirrors.');
-  await api('/sources/'+sid+(del?'?delete_mirrors=1':''),{method:'DELETE'});location='/sources'+Q};
+  await api('/sources/'+sid+(del?'?delete_mirrors=1':''),{method:'DELETE'});location='/sources'};
  const ack=$('#ack');if(ack)ack.onclick=async()=>{await post('/sources/'+sid+'/ack');detail()};
  const aa=$('#appall');if(aa)aa.onclick=async()=>{aa.disabled=true;await post('/sources/'+sid+'/approve',{all:true});detail()};
  document.querySelectorAll('[data-a]').forEach(b=>b.onclick=async()=>{await post('/sources/'+sid+'/'+b.dataset.a,{paths:[b.closest('tr').dataset.p]});detail()});
@@ -2679,9 +2976,8 @@ EVENTS = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewpor
 <div class=card><div class=scroll><table id=tb></table></div><div class=row style="margin-top:8px"><button id=more hidden>Load older</button></div></div></main>
 <script>
 const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const tok=new URLSearchParams(location.search).get('token'),Q=tok?'?token='+encodeURIComponent(tok):'';
-const api=(p,o={})=>fetch('/api'+p+(tok?(p.includes('?')?'&':'?')+'token='+encodeURIComponent(tok):''),{...o,headers:{'Content-Type':'application/json'}});
-$('#back').href='/'+Q;
+const api=(p,o={})=>fetch('/api'+p,{...o,headers:{'Content-Type':'application/json'}}).then(r=>{if(r.status==401)location='/login';return r});
+$('#back').href='/';
 let rows=[],total=0;
 const NAMES={history_changed:'history rewritten',origin_missing:'origin missing',origin_back:'origin back',held:'held',held_accepted:'hold accepted',held_rejected:'hold: kept mine',gone_from_source:'gone from account',
  fsck_failed:'integrity failed',fsck_ok:'integrity ok',source_created:'source added',source_scan:'source scan',source_gone:'vanished from account',source_scan_failed:'scan failed'};
@@ -2694,10 +2990,47 @@ function draw(){const t=$('#type').value,w=$('#q').value.toLowerCase().split(/\s
  const v=rows.filter(e=>(!t||e.type==t)&&w.every(x=>(e.summary+' '+(e.mirror||e.source)+' '+e.type).toLowerCase().includes(x)));
  $('#count').textContent=v.length+' shown';
  $('#tb').innerHTML='<tr><th>When</th><th>Where</th><th>What</th><th>Details</th></tr>'+(v.map(e=>`<tr class="${e.alert?'err':''}"><td class=n>${new Date(e.time*1000).toLocaleString()}</td>
-  <td>${e.mirror?`<a href="/repo/${e.mirror_id}${Q}">${esc(e.mirror)}</a>`:`<a href="/source/${e.source_id}${Q}">${esc(e.source)}</a> <span class=mut>(source)</span>`}</td>
+  <td>${e.mirror?`<a href="/repo/${e.mirror_id}">${esc(e.mirror)}</a>`:`<a href="/source/${e.source_id}">${esc(e.source)}</a> <span class=mut>(source)</span>`}</td>
   <td class=n>${esc(NAMES[e.type]||e.type)}</td><td>${esc(e.summary)}${e.refs?` <span class=mut>(${e.refs} refs)</span>`:''}</td></tr>`).join('')||'<tr><td class=mut colspan=4>No events.</td></tr>');
  $('#more').hidden=rows.length>=total}
 $('#alerts').onchange=()=>load();$('#type').onchange=draw;$('#q').oninput=draw;$('#more').onclick=()=>load(true);load();
+</script></html>"""
+
+LOGIN = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Sign in · Git Mirror</title>
+<style>__STYLE__</style><style>.auth{max-width:380px;margin:12vh auto 0}.auth form{grid-template-columns:1fr}</style>
+<main class=auth><h1><a class=brand href="https://github.com/konetzed/gitmirror" target=_blank rel="noopener noreferrer">Git Mirror</a></h1>
+<div class=card><form id=f>
+<label class=cap>Username<input name=username autocomplete=username required autofocus></label>
+<label class=cap>Password<input name=password type=password autocomplete=current-password required></label>
+<div class=err id=e></div><button class=p>Sign in</button></form></div></main>
+<script>
+const f=document.querySelector('#f'),e=document.querySelector('#e');
+fetch('/api/auth/status').then(r=>r.json()).then(s=>{if(s.setup_required)location='/setup'});
+f.onsubmit=async ev=>{ev.preventDefault();e.textContent='';
+ const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:f.username.value,password:f.password.value})});
+ const j=await r.json();if(r.ok)location='/';else e.textContent=j.error||'Sign-in failed'};
+</script></html>"""
+
+SETUP = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Create your account · Git Mirror</title>
+<style>__STYLE__</style><style>.auth{max-width:420px;margin:10vh auto 0}.auth form{grid-template-columns:1fr}</style>
+<main class=auth><h1><a class=brand href="https://github.com/konetzed/gitmirror" target=_blank rel="noopener noreferrer">Git Mirror</a></h1>
+<div class=card><b>Create your account</b>
+<div class=mut style="margin:4px 0 10px">Welcome. Choose the username and password you will use to sign in. The password is stored hashed (scrypt) on this server and never leaves it.</div>
+<form id=f>
+<label class=cap>Username<input name=username autocomplete=username required autofocus pattern="[A-Za-z0-9_.@+\-]{1,64}" title="Letters, digits and . _ @ + -"></label>
+<label class=cap>Password (8 or more characters)<input name=password type=password autocomplete=new-password minlength=8 required></label>
+<label class=cap>Repeat the password<input name=again type=password autocomplete=new-password minlength=8 required></label>
+<label class=cap id=codebox hidden>Setup code<input name=setup_code type=password autocomplete=off><span class=mut>The GITMIRROR_TOKEN value this server was started with. It makes sure only you can create the first account.</span></label>
+<div class=err id=e></div><button class=p>Create account</button></form></div></main>
+<script>
+const f=document.querySelector('#f'),e=document.querySelector('#e');
+fetch('/api/auth/status').then(r=>r.json()).then(s=>{if(!s.setup_required)location='/login';document.querySelector('#codebox').hidden=!s.setup_code_required;f.setup_code.required=!!s.setup_code_required});
+f.onsubmit=async ev=>{ev.preventDefault();e.textContent='';
+ if(f.password.value!==f.again.value){e.textContent='The two passwords differ.';return}
+ const r=await fetch('/api/auth/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:f.username.value,password:f.password.value,setup_code:f.setup_code.value})});
+ const j=await r.json();if(r.ok)location='/';else e.textContent=j.error||'Could not create the account'};
 </script></html>"""
 
 
@@ -2707,8 +3040,8 @@ def main():
     ap.add_argument("--port", type=int, default=int(os.environ.get("GITMIRROR_PORT", "8080")))
     ap.add_argument("--data", default=os.environ.get("GITMIRROR_DATA") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
     a = ap.parse_args()
-    global PAGE, ADMIN, REPO, MAINT, SOURCES, EVENTS
-    PAGE, ADMIN, REPO, MAINT, SOURCES, EVENTS = (x.replace("<style>__STYLE__</style>", THEME_JS + "<style>" + STYLE + "</style>") for x in (PAGE, ADMIN, REPO, MAINT, SOURCES, EVENTS))
+    global PAGE, ADMIN, REPO, MAINT, SOURCES, EVENTS, LOGIN, SETUP
+    PAGE, ADMIN, REPO, MAINT, SOURCES, EVENTS, LOGIN, SETUP = (x.replace("<style>__STYLE__</style>", THEME_JS + "<style>" + STYLE + "</style>") for x in (PAGE, ADMIN, REPO, MAINT, SOURCES, EVENTS, LOGIN, SETUP))
     try:
         Handler.store = Store(a.data)
     except OSError as e:
@@ -2716,8 +3049,12 @@ def main():
                  f"It is running as uid {os.getuid() if hasattr(os, 'getuid') else '?'}. The directory must exist and that user needs read and write access\n"
                  f"(on TrueNAS: make the dataset owned by the app user, uid 568; in Docker: chown the folder to 1000).")
     threading.Thread(target=scheduler, args=(Handler.store,), daemon=True).start()
-    if a.host not in ("127.0.0.1", "localhost", "::1") and not Handler.token:
-        print("WARNING: listening on a non-loopback address without GITMIRROR_TOKEN; anyone who can reach it can add mirrors.")
+    if not Handler.store.auth:
+        where = f"http://{'localhost' if a.host in ('0.0.0.0', '::') else a.host}:{a.port}/setup"
+        print(f"No account yet: open {where} to create the admin account." + (" You will need the GITMIRROR_TOKEN value as the setup code." if API_TOKEN else ""), flush=True)
+        if a.host not in ("127.0.0.1", "localhost", "::1") and not API_TOKEN:
+            print("WARNING: listening on a non-loopback address with no GITMIRROR_TOKEN; whoever opens the page first can create the account. "
+                  "Set GITMIRROR_TOKEN to require a setup code.", flush=True)
     print(f"gitmirror on http://{a.host}:{a.port}  data={Handler.store.data}")
     httpd = ThreadingHTTPServer((a.host, a.port), Handler)
     reloading = threading.Event()
