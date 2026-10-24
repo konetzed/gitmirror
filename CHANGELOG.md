@@ -4,6 +4,8 @@ All notable changes to gitmirror are listed here, newest first. Versions follow 
 
 ## [Unreleased]
 
+- Docs: a contents line at the top of the README; the TrueNAS section now covers generating the setup code, using personal keys for scripts, and updating with a pinned tag or `pull_policy: always`.
+
 ## [0.1.0] - 2026-10-24
 
 First stable release: the `latest` image tag now points at it. It rolls up the 0.0.3-beta review fixes below and the cleared code-scanning alerts.

@@ -5,6 +5,8 @@ Built to survive takedowns: if an origin rewrites history, deletes branches or d
 
 One Python file, standard library only. Needs `git` (and optionally `git-lfs` and `openssh-client`).
 
+**Contents:** [Screenshots](#screenshots) · [Run it with Docker](#run-it-with-docker) · [Updating](#updating) · [Data layout](#data-layout-data) · [Run on TrueNAS SCALE](#run-on-truenas-scale-2410-or-newer) ([updating](#updating-on-truenas)) · [Running without Docker](#running-without-docker) · [What it does](#what-it-does) · [Monitoring](#monitoring) · [Security notes](#security-notes) · [License](#license)
+
 ## Screenshots
 
 Dark theme, with demo data. There are also light, sepia, OLED and high-contrast themes, picked from the sun/moon switch and the palette button.
@@ -104,11 +106,21 @@ Back up the whole `data` directory (or just `configs/` plus `repos/`). **Admin >
 SCALE 24.10 and later run apps on Docker, so the published image works as a custom app.
 
 1. **Make a dataset** for gitmirror's data, for example `tank/apps/gitmirror`. Give the `apps` user (uid 568) ownership with read and write access (**Storage**, then the dataset's **Permissions**; the "Apps" ACL preset does this if your version offers it).
-2. **Install the app:** **Apps**, **Discover Apps**, the three-dot menu at the top right, **Install via YAML**. Name it `gitmirror`, paste [`deploy/truenas-scale.yaml`](deploy/truenas-scale.yaml), and change the two lines marked `CHANGE`: the token and the dataset path. The wording of the menu varies slightly between releases. If you prefer the form instead, use image `ghcr.io/konetzed/gitmirror`, port `8080`, user and group `568`, the `GITMIRROR_TOKEN` variable, and a host-path volume from your dataset to `/data`.
-3. **Open it** at `http://<your-nas>:8080` and create your account: pick a username and password, and enter the `GITMIRROR_TOKEN` from the YAML as the setup code. The app card shows a health status from the image's built-in check.
+2. **Generate a setup code** with `openssl rand -hex 24` (or any long random string). Never leave the placeholder from the YAML in place: the token doubles as an operator-level Bearer credential for the API.
+3. **Install the app:** **Apps**, **Discover Apps**, the three-dot menu at the top right, **Install via YAML**. Name it `gitmirror`, paste [`deploy/truenas-scale.yaml`](deploy/truenas-scale.yaml), and change the two lines marked `CHANGE`: the token and the dataset path. The wording of the menu varies slightly between releases. If you prefer the form instead, use image `ghcr.io/konetzed/gitmirror`, port `8080`, user and group `568`, the `GITMIRROR_TOKEN` variable, and a host-path volume from your dataset to `/data`.
+4. **Open it** at `http://<your-nas>:8080` and create your account: pick a username and password, and enter the `GITMIRROR_TOKEN` from the YAML as the setup code. The app card shows a health status from the image's built-in check.
    If the app stops right away and its log says it can't use its data directory, the dataset's owner isn't `apps` (uid 568) or it is read-only: fix the permissions and start it again.
-4. **Update it** by changing the image tag in the app's YAML (for example `:0.1.0` to `:0.1.1`) and saving. Pinning a version tag is more reliable than `latest`, because TrueNAS does not re-pull an unchanged tag.
-5. **Back it up** by snapshotting and replicating the dataset: it holds every mirror and all settings.
+5. **Scripts and sensors:** create a personal API key on the **Account** page (read-only is enough for Home Assistant) instead of reusing `GITMIRROR_TOKEN`. Once your account exists the token is only needed as a setup code; you may remove it from the YAML.
+6. **Back it up** by snapshotting and replicating the dataset: it holds every mirror and all settings.
+
+### Updating on TrueNAS
+
+TrueNAS pulls an image once and does not re-pull an unchanged tag, and a plain container restart never pulls. Pick one:
+
+- **Pinned version (recommended):** change the tag in the app's YAML (for example `:0.1.0` to `:0.1.1`) and save. You choose when to upgrade.
+- **Follow `latest`:** use `image: ghcr.io/konetzed/gitmirror:latest` with `pull_policy: always` under the service. The image is fetched each time the app is *started* (stop, then start it, or save it again), so `latest` always means the newest stable release. Pre-releases never move `latest`.
+
+Either way, check the version badge in the page header afterwards. Before upgrading, snapshot the dataset: a newer version may migrate the data format, and an older gitmirror will not warn you about data it did not write.
 
 Keep it on your LAN and keep `GITMIRROR_TOKEN` set (it stops a stranger on the network from creating the account before you do). To reach it from outside, put an HTTPS reverse proxy with its own login in front. Private repositories over SSH work too: put the key in the dataset (`ssh/id_ed25519`, mode 600, owned by the app user) and enable the `GIT_SSH_COMMAND` line in the YAML.
 
