@@ -1,0 +1,17 @@
+services:
+  gitmirror:
+    build: .
+    image: gitmirror:latest
+    container_name: gitmirror
+    restart: unless-stopped
+    user: "1000:1000"            # must own ./data on the host (chown 1000:1000 data)
+    ports:
+      - "127.0.0.1:8080:8080"    # localhost only; put a reverse proxy with HTTPS in front to share it
+    environment:
+      GITMIRROR_TOKEN: "${GITMIRROR_TOKEN:-}"                 # require this token for the web UI and API
+      GITMIRROR_GITHUB_TOKEN: "${GITMIRROR_GITHUB_TOKEN:-}"   # optional: lifts GitHub's 60 requests/hour limit
+      TZ: "${TZ:-UTC}"
+    volumes:
+      - ./data:/data
+      # SSH remotes (private repos): mount a key read-only, then use git@host:owner/repo.git URLs
+      # - ~/.ssh/id_ed25519:/home/gitmirror/.ssh/id_ed25519:ro

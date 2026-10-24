@@ -1,0 +1,7 @@
+# runtime data and local test output
+data/
+mirror/
+__pycache__/
+*.pyc
+*.bak*
+.env

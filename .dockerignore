@@ -1,0 +1,8 @@
+data/
+mirror/
+__pycache__/
+*.pyc
+*.bak*
+.git/
+README.md
+docker-compose.yml
