@@ -5,6 +5,30 @@ Built to survive takedowns: if an origin rewrites history, deletes branches or d
 
 One Python file, standard library only. Needs `git` (and optionally `git-lfs` and `openssh-client`).
 
+## Screenshots
+
+Dark theme, with demo data. There are also light, sepia, OLED and high-contrast themes, picked from the sun/moon switch and the palette button.
+
+**Your mirrors.** Search, sort, tag and act on many at once. Cards show sync health, what is waiting for review, and a warning when a repository uses Git LFS but the large files are not being saved.
+
+![The main page with the mirror list](docs/screenshots/main.png)
+
+**Held changes.** With Hold on, an origin that rewrites history or deletes branches can't touch your copy until you accept the change. Nothing is lost either way.
+
+![A mirror with upstream changes on hold](docs/screenshots/held-changes.png)
+
+**Follow a whole account.** Preview every repository of a user, org or group with its size before anything is added. Forks start unchecked, and a 3.7 GB repository is easy to spot.
+
+![Previewing an organisation before mirroring it](docs/screenshots/sources-preview.png)
+
+**Stay on top of it.** New repositories wait for your approval, and repositories that vanish from an account are flagged and kept.
+
+![A followed account with a new repository and one that vanished](docs/screenshots/source.png)
+
+**Housekeeping.** Disk use over time, integrity checks, the largest and oldest mirrors, and anything that needs LFS.
+
+![The maintenance page](docs/screenshots/maintenance.png)
+
 ## Run it with Docker
 
 ```bash

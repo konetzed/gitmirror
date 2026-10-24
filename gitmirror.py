@@ -2276,7 +2276,7 @@ function render(){let ms=cache.slice();
  ${(m.tags||[]).length?`<div class=row style="margin-top:4px">${m.tags.map(t=>`<span class=chip data-tag="${esc(t.toLowerCase())}">${esc(t)}</span>`).join('')}</div>`:''}
  <div class=mut>${m.enabled?(m.interval?'every '+m.interval_text:'manual'):'paused'} · last run ${ago(m.last_run)}${m.duration!=null?' ('+m.duration+'s)':''} · ${sz(m.size)}${m.next_run&&!m.running?' · next '+until(m.next_run):''}</div>
  ${m.held_count?`<div style="color:var(--run)">⏸ ${m.held_count} upstream change(s) on hold <a href="/repo/${m.id}${Q}">review</a></div>`:''}
- ${m.lfs_needed?`<div style="color:var(--run)">⚠ Uses Git LFS (${m.lfs_detect.files??'some'} files${m.lfs_detect.bytes?', '+sz(m.lfs_detect.bytes):''}) but the large files aren't being mirrored. ${m.lfs_detect.installed===false?'git-lfs is not installed on this server.':'<button data-a=lfs>Enable LFS</button>'}</div>`:''}
+ ${m.lfs_needed?`<div style="color:var(--run)">⚠ Uses Git LFS (${m.lfs_detect.files==1?'1 file':(m.lfs_detect.files??'some')+' files'}${m.lfs_detect.bytes?', '+sz(m.lfs_detect.bytes):''}) but the large files aren't being mirrored. ${m.lfs_detect.installed===false?'git-lfs is not installed on this server.':'<button data-a=lfs>Enable LFS</button>'}</div>`:''}
  ${m.failures?`<div class=mut>failed ${m.failures}× in a row${m.retry_at?', retrying '+until(m.retry_at):''}</div>`:''}
  ${m.alert?`<div class=err>⚠ ${esc(m.alert)} <a href="/repo/${m.id}${Q}">details</a></div>`:''}
  ${m.error?`<div class=err>${esc(m.error)}</div>`:''}
@@ -2411,7 +2411,7 @@ function render(){const mt=m.meta||{},g=m.git||{},st=m.running?'running':m.statu
  $('#alertcard').style.display=m.alert?'':'none';
  loadExtras();$('#alerttxt').textContent=m.alert||'';
  $('#evs').innerHTML=(m.events||[]).slice().reverse().map(e=>`<details ${e.alert?'open':''} style="margin-bottom:8px"><summary class="${e.alert?'err':''}">${when(e.time)} · ${esc(e.type.replace('_',' '))} <span class=mut>— ${esc(e.summary).slice(0,160)}</span></summary>
-  ${(e.refs||[]).length?`<div class=mut style="margin:6px 0">Get one back: <code>git -C ${esc(m.local_path)} branch RESTORED-NAME &lt;old commit&gt;</code></div><pre>${e.refs.map(r=>esc(`${r.kind.padEnd(9)} ${r.ref}  was ${r.old.slice(0,12)}  kept as ${r.archive}`)).join('\n')}</pre>`:''}</details>`).join('')||'<span class=mut>Nothing has been removed or rewritten upstream.</span>';
+  ${(e.refs||[]).length?`${e.refs.some(r=>r.archive)?`<div class=mut style="margin:6px 0">Get one back: <code>git -C ${esc(m.local_path)} branch RESTORED-NAME &lt;old commit&gt;</code></div>`:''}<pre>${e.refs.map(r=>esc(`${r.kind.padEnd(9)} ${r.ref}  was ${r.old.slice(0,12)}  ${r.archive?'kept as '+r.archive:(r.new?'upstream now '+r.new.slice(0,12)+', not applied':'deleted upstream, not applied')}`)).join('\n')}</pre>`:''}</details>`).join('')||'<span class=mut>Nothing has been removed or rewritten upstream.</span>';
  const rows=[
   ['Origin',mt.web_url?link(mt.web_url):'—'],
   ['Description',mt.description?esc(mt.description):'—'],
@@ -2455,7 +2455,7 @@ async function loadExtras(){const sig=JSON.stringify(m.extras_state||{})+JSON.st
  const j=await (await api('/mirrors/'+id+'/extras')).json(),st=j.state||{},ex=m.extras||{};let h='';
  const line=(k,t)=>ex[k]?`<div class=${st[k]&&st[k].state=='error'?'err':'mut'}>${t}</div>`:'';
  const S=k=>st[k]||{};
- const ld=m.lfs_detect;if(ld&&ld.used)h+=`<div class="${m.lfs_needed?'err':'mut'}">Git LFS: this repo stores ${ld.files??'some'} large files${ld.bytes?' ('+sz(ld.bytes)+')':''}${m.lfs_needed?(ld.installed===false?' and git-lfs is not installed on this server, so they are not being mirrored.':' and they are not being mirrored. <button id=lfson>Enable LFS</button>'):'.'}</div>`;
+ const ld=m.lfs_detect;if(ld&&ld.used)h+=`<div class="${m.lfs_needed?'err':'mut'}">Git LFS: this repo stores ${ld.files==1?'1 large file':(ld.files??'some')+' large files'}${ld.bytes?' ('+sz(ld.bytes)+')':''}${m.lfs_needed?(ld.installed===false?' and git-lfs is not installed on this server, so they are not being mirrored.':' and they are not being mirrored. <button id=lfson>Enable LFS</button>'):'.'}</div>`;
  h+=line('wiki',S('wiki').state=='ok'?`Wiki: mirrored (${sz(S('wiki').size)}) at <code>${esc(m.local_path.replace(/\.git$/,'.wiki.git'))}</code>`:S('wiki').state=='none'?'Wiki: this repository has none':S('wiki').state=='error'?'Wiki: '+esc(S('wiki').msg):'Wiki: not fetched yet');
  h+=line('lfs',S('lfs').state=='ok'?`Git LFS: fetched (${sz(S('lfs').size)})`:S('lfs').state=='error'?'Git LFS: '+esc(S('lfs').msg):'Git LFS: not fetched yet');
  h+=line('releases',S('releases').state=='ok'?`Releases: ${S('releases').count} saved, ${S('releases').downloaded} new files downloaded${S('releases').skipped?', '+S('releases').skipped+' skipped (size limit or failed)':''}, ${sz(S('releases').bytes)} on disk`:S('releases').state=='error'?'Releases: '+esc(S('releases').msg):'Releases: not fetched yet');
@@ -2510,7 +2510,7 @@ $('#back').href=only?'/maintenance'+Q:'/'+Q;$('#back').textContent=only?'Back to
 if(only){$('#title').textContent=kinds[only][0];document.title=kinds[only][0]+' · Git Mirror'}
 const status=m=>m.origin_missing?'<span class=err>origin missing</span>':m.status=='error'?'<span class=err>error</span>':esc(m.status)+(m.enabled?'':' (paused)');
 const table=rows=>rows.length?`<div class=scroll><table><tr><th>Name</th><th>Added</th><th>Last good sync</th><th>Size</th><th>Status</th><th>Tags</th><th></th></tr>${rows.map(m=>`<tr data-id=${m.id}>
- <td><a href="/repo/${m.id}${Q}">${esc(m.name)}</a>${m.lfs_needed&&m.lfs_detect?` <span class=mut>LFS: ${m.lfs_detect.files??'?'} files, ${bytes(m.lfs_detect.bytes)}</span>`:''}</td><td class=n>${day(m.added)}</td><td class=n>${ago(m.last_ok)}</td><td class=n>${bytes(m.size)}</td><td>${status(m)}</td>
+ <td><a href="/repo/${m.id}${Q}">${esc(m.name)}</a>${m.lfs_needed&&m.lfs_detect?` <span class=mut>LFS: ${m.lfs_detect.files==1?'1 file':(m.lfs_detect.files??'?')+' files'}, ${bytes(m.lfs_detect.bytes)}</span>`:''}</td><td class=n>${day(m.added)}</td><td class=n>${ago(m.last_ok)}</td><td class=n>${bytes(m.size)}</td><td>${status(m)}</td>
  <td>${(m.tags||[]).map(t=>`<span class=chip style="cursor:default">${esc(t)}</span>`).join(' ')}</td>
  <td class=n>${m.lfs_needed?'<button data-a=lfs>Enable LFS</button> ':''}<button data-a=opt>Optimize</button> <button data-a=del>Delete</button></td></tr>`).join('')}</table></div>`:'<p class=mut>Nothing here.</p>';
 async function loadLists(){const ks=only?[only]:Object.keys(kinds);
@@ -2581,7 +2581,7 @@ async function list(){
 function renderPreview(){const j=preview,a=j.account;
  if(j.source_id){$('#prev').innerHTML=`<div class=card>You already follow this account. <a href="/source/${j.source_id}${Q}">Open it</a>.</div>`;return}
  const tot=j.repos.reduce((n,r)=>n+(r.size_kb||0),0);
- $('#prev').innerHTML=`<div class=card><div class=row><b>${esc(a.name)}</b><span class=mut>${esc(a.kind)} ${esc(a.type)} · ${j.repos.length} repositories · ${j.repos.filter(r=>r.fork).length} forks · ${j.repos.filter(r=>r.arch).length} archived · about ${kb(tot)} on the host</span></div>
+ $('#prev').innerHTML=`<div class=card><div class=row><b>${esc(a.name)}</b><span class=mut>${esc(a.kind)} ${esc(a.type)} · ${j.repos.length} repositories · ${j.repos.filter(r=>r.fork).length} fork${j.repos.filter(r=>r.fork).length==1?'':'s'} · ${j.repos.filter(r=>r.arch).length} archived · about ${kb(tot)} on the host</span></div>
   <div class=scroll><table><tr><th><input type=checkbox id=all style="width:auto"></th><th>Repository</th><th>Size</th><th>Stars</th><th></th></tr>
   ${j.repos.map((r,i)=>`<tr><td><input type=checkbox style="width:auto" data-i=${i} ${r.selected&&!r.mirrored?'checked':''}></td>
    <td><b>${esc(r.name)}</b> ${r.fork?'<span class=chip style="cursor:default">fork</span>':''}${r.arch?'<span class=chip style="cursor:default">archived</span>':''}${r.mirrored?'<span class=chip style="cursor:default">already mirrored</span>':''}<div class=mut>${esc(r.desc||'')}</div></td>
