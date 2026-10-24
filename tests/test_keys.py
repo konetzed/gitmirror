@@ -164,10 +164,12 @@ class HeaderAuthTests(KeyTests):
         both = dict(ext, Authorization="Bearer " + k)
         self.assertEqual(self.req("POST", "/api/maintenance/verify", {}, cookie=self.cookies["operator"], headers=both)[0], 403)  # a cookie present: stay strict
 
-    def test_wrong_keys_are_throttled_like_wrong_passwords(self):
-        codes = [self.with_key("gm_" + "x" * 43, "GET", "/api/mirrors")[0] for _ in range(gm.LOGIN_MAX + 2)]
-        self.assertEqual(codes[:gm.LOGIN_MAX], [401] * gm.LOGIN_MAX)
-        self.assertEqual(codes[gm.LOGIN_MAX:], [429, 429])
+    def test_wrong_keys_are_throttled_in_their_own_bucket(self):
+        gm.BEARER_FAILS.clear()
+        codes = [self.with_key("gm_" + "x" * 43, "GET", "/api/mirrors")[0] for _ in range(gm.BEARER_MAX + 2)]
+        self.assertEqual(codes[:gm.BEARER_MAX], [401] * gm.BEARER_MAX)
+        self.assertEqual(codes[gm.BEARER_MAX:], [429, 429])
+        gm.BEARER_FAILS.clear()
 
     def test_garbage_after_bearer_is_just_unauthorized(self):
         for value in ("Bearer ", "Bearer gm_", "Bearer gm_" + "é" * 5, "Basic abc"):

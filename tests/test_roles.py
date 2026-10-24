@@ -15,7 +15,7 @@ class RuleTests(unittest.TestCase):
             ("GET", "/api/mirrors", "viewer"), ("GET", "/api/mirrors/abc123", "viewer"), ("GET", "/api/mirrors/abc123/log", "viewer"),
             ("GET", "/api/mirrors/abc123/extras", "viewer"), ("GET", "/api/stats", "viewer"), ("GET", "/api/summary", "viewer"),
             ("GET", "/api/history", "viewer"), ("GET", "/api/events", "viewer"), ("GET", "/api/maintenance", "viewer"),
-            ("GET", "/api/sources", "viewer"), ("GET", "/api/sources/abc123", "viewer"), ("GET", "/api/settings", "viewer"),
+            ("GET", "/api/sources", "viewer"), ("GET", "/api/sources/abc123", "viewer"), ("GET", "/api/settings", "operator"),
             ("GET", "/api/version", "viewer"), ("GET", "/api/auth/me", "viewer"), ("GET", "/dl/abc123/releases/v1/tool.bin", "viewer"),
             ("GET", "/admin", "admin"), ("GET", "/api/export", "admin"), ("GET", "/api/users", "admin"), ("GET", "/api/audit", "admin"), ("GET", "/account", "viewer"), ("GET", "/api/keys", "viewer"),
             ("POST", "/api/keys", "viewer"), ("DELETE", "/api/keys/abc123", "viewer"),
@@ -66,7 +66,7 @@ class RoleServerBase(Base):
 class EnforcementTests(RoleServerBase):
     CASES = [  # (method, path, body, may viewer, may operator, may admin)
         ("GET", "/api/mirrors", None, 1, 1, 1),
-        ("GET", "/api/settings", None, 1, 1, 1),
+        ("GET", "/api/settings", None, 0, 1, 1),
         ("POST", "/api/maintenance/verify", {}, 0, 1, 1),
         ("POST", "/api/mirrors/zzz/sync", {}, 0, 1, 1),
         ("PUT", "/api/mirrors/zzz", {"name": "x"}, 0, 1, 1),

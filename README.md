@@ -45,6 +45,8 @@ Open <http://127.0.0.1:8080>. The first visit asks you to create a username and 
 | Setup code and script token | `GITMIRROR_TOKEN`: required once to create the first account, and accepted as `Authorization: Bearer <token>` by scripts such as Home Assistant. Optional but recommended |
 | What the script token may do | `GITMIRROR_TOKEN_ROLE`: `operator` (default) or `viewer` for read-only sensors. It is never an admin |
 | GitHub API token (higher rate limit) | `GITMIRROR_GITHUB_TOKEN`, or the Admin page |
+| Outbound requests | Forge lookups and release downloads never reach loopback or link-local addresses, and a release-asset link may only reach the public internet or the forge it came from. `GITMIRROR_ALLOW_LOCAL_HOSTS=1` lifts the loopback rule for development |
+| Local repositories | `file://` clone URLs let whoever adds them mirror anything the service account can read, so only admins may add them; `GITMIRROR_ALLOW_FILE_REMOTES=1` extends that to operators. Mirrors created earlier keep syncing |
 | Behind a reverse proxy | `GITMIRROR_TRUSTED_PROXIES`: the proxy's address or network (`127.0.0.1`, `172.18.0.0/16`, comma separated). Without it every visitor shares the proxy's address, so the sign-in rate limit locks everyone out together and "last used from" shows the proxy. Only list addresses you control |
 | Port / host / data dir | `GITMIRROR_PORT`, `GITMIRROR_HOST`, `GITMIRROR_DATA` (the image sets `8080`, `0.0.0.0`, `/data`) |
 | Private repos over HTTPS | put a token in the clone URL: `https://user:TOKEN@host/owner/repo.git` (stored in `mirrors.json`, masked in the UI and exports) |
@@ -61,7 +63,7 @@ export GITMIRROR_TOKEN="$(openssl rand -hex 24)"   # note it down; it is the set
 mkdir -p data && sudo chown 1000:1000 data
 docker run -d --name gitmirror --restart unless-stopped \
   -p 127.0.0.1:8080:8080 -e GITMIRROR_TOKEN -v "$PWD/data:/data" \
-  ghcr.io/konetzed/gitmirror:latest
+  ghcr.io/konetzed/gitmirror:0.0.3-beta
 ```
 
 | Tag | What you get |
@@ -131,7 +133,7 @@ python3 gitmirror.py --data ./data --port 8080
 
 ## Monitoring
 
-- `GET /healthz` needs no sign-in: `200 {"ok": true, "version": ...}` while the scheduler is alive and the data directory is writable. Docker uses it for its health check.
+- `GET /healthz` needs no sign-in: `200 {"ok": true, "version": ...}` while the scheduler is alive and the data directory is writable. Docker uses it for its health check. Note that this reveals the running version to anyone who can reach the port.
 - `GET /api/summary` (send `Authorization: Bearer <token>`: a read-only personal API key from your Account page is enough for a sensor, or `GITMIRROR_TOKEN`, optionally with `GITMIRROR_TOKEN_ROLE=viewer`) returns flat numbers for dashboards: `projects`, `disk_bytes`, `disk_free_bytes`, `failing`, `alerts`, `held`, `origin_missing`, `pending_approval`, `low_disk`, `stalest_sync_hours`, ...
 
 Home Assistant example:

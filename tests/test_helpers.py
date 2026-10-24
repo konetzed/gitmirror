@@ -76,9 +76,15 @@ class UrlHelperTests(unittest.TestCase):
         self.assertNotEqual(gm.norm_src("https://github.com/org/repo"), gm.norm_src("https://github.com/org/repo2"))
 
     def test_check_url(self):
-        for ok in ("https://h/o/r.git", "ssh://git@h/o/r", "git://h/r", "file:///x", "git@h:o/r.git"):
+        for ok in ("https://h/o/r.git", "ssh://git@h/o/r", "git://h/r", "git@h:o/r.git"):
             gm.check_url(ok, "source")
-        for bad in ("-oProxyCommand=evil", "ext::sh -c evil", "ftp://h/r", "/local/path", "h/o/r"):
+        self.assertRaises(ValueError, gm.check_url, "file:///x", "source")  # off by default
+        gm.ALLOW_FILE_REMOTES = True
+        try:
+            gm.check_url("file:///x", "source")
+        finally:
+            gm.ALLOW_FILE_REMOTES = False
+        for bad in ("-oProxyCommand=evil", "ext::sh -c evil", "ftp://h/r", "/local/path", "h/o/r", "https://h/x --upload-pack=evil"):
             with self.subTest(bad=bad):
                 self.assertRaises(ValueError, gm.check_url, bad, "source")
 

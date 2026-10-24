@@ -4,6 +4,26 @@ All notable changes to gitmirror are listed here, newest first. Versions follow 
 
 ## [Unreleased]
 
+### Upgrading
+
+- `file://` clone URLs can now be added only by admins, unless `GITMIRROR_ALLOW_FILE_REMOTES=1` extends that to operators. Mirrors that already use one keep syncing.
+- The GitHub Enterprise, Gitea and GitLab hosts you point mirrors at may be on your private network as before, but no forge lookup or release download will reach a loopback or link-local address any more. Set `GITMIRROR_ALLOW_LOCAL_HOSTS=1` if you really run a forge on the same machine.
+
+### Fixed
+
+- **Release-asset links could point the server at anything it can reach.** A link in a mirrored project's release (chosen by that project's maintainer, not by you) was downloaded from inside your network, stored, and served back from the download route. Such links may now only reach the public internet or the forge the mirror came from; every redirect hop is checked the same way, and the GitHub token is never sent on to another host.
+- **Failed sign-ins no longer lock scripts out.** Wrong keys and tokens are counted separately from wrong passwords (30 per address per 10 minutes), so a stranger guessing passwords behind a shared address can't make Home Assistant or your API keys return 429. The global sign-in limit no longer applies to Bearer requests.
+- Malformed requests that used to end the connection with a traceback in the log (deeply nested JSON before sign-in, a non-string `source`, a `1e400` setting, a string where the import expects a list) now get a 400, and anything unexpected gets a JSON 500 with one log line.
+- A tag list of tens of thousands of entries no longer keeps a core busy for minutes: the 20-tag limit stops the work at once.
+- The `Server` header no longer reveals the Python version.
+- Viewers can no longer read `/api/settings` (operator and up); the main page handles that quietly.
+- The sign-in and key throttles are protected by a lock, as is the key lookup while an admin edits users.
+- A key used from a changing address no longer rewrites `auth.json` on every request; "last used from" is refreshed at most once a minute like "last used".
+- Release-asset links from a forge are kept only when they are `http(s)` URLs, like every other link from an API.
+- Every `git` subprocess runs with no stdin, which removes a class of environment-dependent clone failures.
+- Clone URLs containing whitespace are rejected.
+- Doc fixes: the `docker run` example pins `0.0.3-beta` instead of `latest` (which still points at an old build until the first stable release); `/healthz` is noted as revealing the version. The 0.0.3-beta note "every file gitmirror writes mode 600" applies to the JSON files in `configs/`; per-mirror logs and the extras folder rely on the 700 data folder.
+
 ## [0.0.3-beta] - 2026-10-24
 
 ### Upgrading

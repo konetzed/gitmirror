@@ -24,7 +24,7 @@ Send SIGHUP (kill -HUP <pid>) to re-exec with the latest code on disk.
 The first visit to the web UI asks you to create a username and password (stored hashed in <data>/configs/auth.json).
 GITMIRROR_TOKEN is optional: it is the setup code for that first account and a Bearer token for scripts ("Authorization: Bearer <token>").
 """
-import argparse, base64, hashlib, hmac, http.cookies, ipaddress, json, os, re, secrets, shutil, signal, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
+import argparse, base64, hashlib, hmac, http.cookies, ipaddress, json, os, re, secrets, shutil, signal, socket, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -40,6 +40,8 @@ TOKEN_ROLE = os.environ.get("GITMIRROR_TOKEN_ROLE", "operator").strip().lower()
 if TOKEN_ROLE not in ("viewer", "operator"):  # the script token is never an admin
     TOKEN_ROLE = "operator"
 URL_RE = re.compile(r"^(https?://|ssh://|git://|file://|[\w.-]+@[\w.-]+:)")
+# file:// lets an operator mirror any repository the service account can read on the server itself: off unless asked for
+ALLOW_FILE_REMOTES = os.environ.get("GITMIRROR_ALLOW_FILE_REMOTES", "0").lower() in ("1", "true", "yes")
 GIT_ENV = {
     **os.environ,
     "GIT_TERMINAL_PROMPT": "0",
@@ -299,7 +301,7 @@ HOLD_CONFIG = (("gc.auto", "0"), ("gc.pruneExpire", "never"), ("gc.reflogExpire"
 def run_git(args, cwd, log, timeout):
     log.write("$ git " + mask(" ".join(args)) + "\n")
     log.flush()
-    p = subprocess.run(["git", *args], cwd=cwd, env=GIT_ENV, capture_output=True, text=True, timeout=timeout)
+    p = subprocess.run(["git", *args], cwd=cwd, env=GIT_ENV, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
     out = mask((p.stdout or "") + (p.stderr or ""))
     log.write(out + ("" if out.endswith("\n") or not out else "\n"))
     if p.returncode:
@@ -309,7 +311,7 @@ def run_git(args, cwd, log, timeout):
 
 
 def git_cfg(repo, *a):
-    return subprocess.run(["git", "config", *a], cwd=repo, env=GIT_ENV, capture_output=True, text=True).stdout
+    return subprocess.run(["git", "config", *a], cwd=repo, env=GIT_ENV, stdin=subprocess.DEVNULL, capture_output=True, text=True).stdout
 
 
 def protect_repo(repo):
@@ -323,7 +325,7 @@ def protect_repo(repo):
 
 def ref_snapshot(repo):
     p = subprocess.run(["git", "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads", "refs/tags"],
-                       cwd=repo, env=GIT_ENV, capture_output=True, text=True, timeout=300)
+                       cwd=repo, env=GIT_ENV, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=300)
     return {ref: sha for sha, ref in (l.split(" ", 1) for l in p.stdout.splitlines() if " " in l)}
 
 
@@ -336,13 +338,13 @@ def archive_changes(repo, pre, post, log):
         if new == old:
             continue
         if new is not None:
-            if subprocess.run(["git", "merge-base", "--is-ancestor", old, new], cwd=repo, env=GIT_ENV).returncode == 0:
+            if subprocess.run(["git", "merge-base", "--is-ancestor", old, new], cwd=repo, env=GIT_ENV, stdin=subprocess.DEVNULL).returncode == 0:
                 continue  # normal fast-forward, nothing lost
             kind = "rewritten"
         else:
             kind = "deleted"
         dest = f"refs/archive/{ts}/{ref[len('refs/'):]}"
-        subprocess.run(["git", "update-ref", dest, old], cwd=repo, env=GIT_ENV, capture_output=True)
+        subprocess.run(["git", "update-ref", dest, old], cwd=repo, env=GIT_ENV, stdin=subprocess.DEVNULL, capture_output=True)
         log.write(f"ARCHIVED {kind} {ref} (was {old[:10]}) -> {dest}\n")
         events.append({"kind": kind, "ref": ref, "old": old, "new": new, "archive": dest})
     return ts, events
@@ -353,7 +355,7 @@ def hold_apply(repo, ignored, log):
     but leave rewritten or deleted refs alone and return them for review."""
     local = ref_snapshot(repo)
     p = subprocess.run(["git", "for-each-ref", "--format=%(objectname) %(refname)", "refs/incoming"],
-                       cwd=repo, env=GIT_ENV, capture_output=True, text=True, timeout=300)
+                       cwd=repo, env=GIT_ENV, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=300)
     inc = {"refs/" + ref[len("refs/incoming/"):]: sha for sha, ref in (l.split(" ", 1) for l in p.stdout.splitlines() if " " in l)}
     held = []
     for ref, new in inc.items():
@@ -361,10 +363,10 @@ def hold_apply(repo, ignored, log):
         if old == new:
             continue
         if old is None:
-            subprocess.run(["git", "update-ref", ref, new], cwd=repo, env=GIT_ENV, capture_output=True)
+            subprocess.run(["git", "update-ref", ref, new], cwd=repo, env=GIT_ENV, stdin=subprocess.DEVNULL, capture_output=True)
             log.write(f"NEW {ref} -> {new[:10]}\n")
-        elif subprocess.run(["git", "merge-base", "--is-ancestor", old, new], cwd=repo, env=GIT_ENV).returncode == 0:
-            subprocess.run(["git", "update-ref", ref, new, old], cwd=repo, env=GIT_ENV, capture_output=True)
+        elif subprocess.run(["git", "merge-base", "--is-ancestor", old, new], cwd=repo, env=GIT_ENV, stdin=subprocess.DEVNULL).returncode == 0:
+            subprocess.run(["git", "update-ref", ref, new, old], cwd=repo, env=GIT_ENV, stdin=subprocess.DEVNULL, capture_output=True)
             log.write(f"FAST-FORWARD {ref} {old[:10]} -> {new[:10]}\n")
         elif ignored.get(ref) != new:
             held.append({"ref": ref, "old": old, "new": new, "kind": "rewritten"})
@@ -389,11 +391,11 @@ def resolve_held(store, mid, accept):
         if accept:
             for h in held:
                 dest = f"refs/archive/{ts}/{h['ref'][len('refs/'):]}"
-                subprocess.run(["git", "update-ref", dest, h["old"]], cwd=repo, env=GIT_ENV, capture_output=True)
+                subprocess.run(["git", "update-ref", dest, h["old"]], cwd=repo, env=GIT_ENV, stdin=subprocess.DEVNULL, capture_output=True)
                 if h["new"]:
-                    subprocess.run(["git", "update-ref", h["ref"], h["new"]], cwd=repo, env=GIT_ENV, capture_output=True)
+                    subprocess.run(["git", "update-ref", h["ref"], h["new"]], cwd=repo, env=GIT_ENV, stdin=subprocess.DEVNULL, capture_output=True)
                 else:
-                    subprocess.run(["git", "update-ref", "-d", h["ref"]], cwd=repo, env=GIT_ENV, capture_output=True)
+                    subprocess.run(["git", "update-ref", "-d", h["ref"]], cwd=repo, env=GIT_ENV, stdin=subprocess.DEVNULL, capture_output=True)
     finally:
         size = mirror_size(store, mid)  # walks the repo: do it before taking the lock
         with store.lock:
@@ -559,7 +561,7 @@ def optimize_one(store, mid):
     before = dir_size(repo)
     try:
         protect_repo(repo)
-        subprocess.run(["git", "-c", "repack.writeBitmaps=false", "-c", "gc.writeCommitGraph=false", "gc", "--quiet"], cwd=repo, env=GIT_ENV, capture_output=True, timeout=timeout)
+        subprocess.run(["git", "-c", "repack.writeBitmaps=false", "-c", "gc.writeCommitGraph=false", "gc", "--quiet"], cwd=repo, env=GIT_ENV, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
     except (subprocess.SubprocessError, OSError):
         pass
     after = dir_size(repo)
@@ -589,7 +591,7 @@ def fsck_one(store, mid):
         timeout = store.settings["timeout"]
     ok, tail = True, ""
     try:
-        p = subprocess.run(["git", "fsck", "--connectivity-only", "--no-dangling"], cwd=store.path(mid), env=GIT_ENV,
+        p = subprocess.run(["git", "fsck", "--connectivity-only", "--no-dangling"], cwd=store.path(mid), env=GIT_ENV, stdin=subprocess.DEVNULL,
                            capture_output=True, text=True, timeout=timeout)
         ok, tail = p.returncode == 0, (p.stdout + p.stderr).strip()[-600:]
     except subprocess.TimeoutExpired:
@@ -809,6 +811,66 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 _probe_opener = urllib.request.build_opener(_NoRedirect)
 
+# ---- outbound requests. The server must never be talked into reading something on its own machine or on the link-local
+# range (cloud metadata lives at 169.254.169.254). Private networks are fine when an operator chose the host (a forge on the
+# LAN) but not when a third party did (a release asset link in a mirrored project). GITMIRROR_ALLOW_LOCAL_HOSTS=1 lifts the
+# loopback/link-local rule for development and tests.
+ALLOW_LOCAL_HOSTS = os.environ.get("GITMIRROR_ALLOW_LOCAL_HOSTS", "0").lower() in ("1", "true", "yes")
+
+
+def host_problem(host, allow_private):
+    """Why this host must not be contacted, or None. The name is resolved and every address it has must pass."""
+    if not host:
+        return "no host in URL"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return f"cannot resolve {host}"
+    for info in infos:
+        try:
+            a = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if a.version == 6 and a.ipv4_mapped:
+            a = a.ipv4_mapped
+        if a.is_link_local or a.is_multicast:
+            return f"{host} is a local address"  # 169.254.169.254 and friends: no override
+        if a.is_loopback or a.is_unspecified:
+            if not ALLOW_LOCAL_HOSTS:
+                return f"{host} is a local address"
+        elif a.is_private and not allow_private:
+            return f"{host} is on a private network"
+    return None
+
+
+class _GuardedRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow redirects only to hosts that pass the same policy, and never carry an Authorization header to another host."""
+
+    def __init__(self, allow_private):
+        self.allow_private = allow_private
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = urllib.parse.urlparse(newurl)
+        why = None if new.scheme in ("http", "https") else "redirect to a non-http URL"
+        why = why or host_problem(new.hostname, self.allow_private)
+        if why:
+            raise urllib.error.HTTPError(newurl, code, "redirect refused: " + why, headers, fp)
+        r = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if r is not None and (new.hostname or "").lower() != (urllib.parse.urlparse(req.full_url).hostname or "").lower():
+            r.remove_header("Authorization")
+        return r
+
+
+def open_url(url, headers, timeout, allow_private):
+    """urlopen with the outbound policy applied to the URL and to every redirect hop. Raises RuntimeError when refused."""
+    p = urllib.parse.urlparse(url)
+    if p.scheme not in ("http", "https"):
+        raise RuntimeError("not an http(s) URL")
+    why = host_problem(p.hostname, allow_private)
+    if why:
+        raise RuntimeError("refused: " + why)
+    return urllib.request.build_opener(_GuardedRedirect(allow_private)).open(urllib.request.Request(url, headers=headers), timeout=timeout)
+
 
 def save_forges():
     if not FORGES_PATH:
@@ -819,6 +881,9 @@ def save_forges():
 
 def _probe_get(url):
     """(status, parsed json or None). Network failures raise OSError."""
+    why = host_problem(urllib.parse.urlparse(url).hostname, allow_private=True)
+    if why:
+        raise OSError(why)  # treated like an unreachable host
     req = urllib.request.Request(url, headers={"User-Agent": "gitmirror", "Accept": "application/json"})
     try:
         r = _probe_opener.open(req, timeout=3)
@@ -977,12 +1042,13 @@ def api_headers(url):
 
 def api_json(url, timeout=15, with_headers=False):
     """GET a forge API URL and parse JSON. Raises RuntimeError with a readable message (rate limit hint included)."""
-    req = urllib.request.Request(url, headers=api_headers(url))
     try:
-        r = urllib.request.urlopen(req, timeout=timeout)
+        r = open_url(url, api_headers(url), timeout, allow_private=True)  # the host was typed by an operator: a LAN forge is fine
         data = json.loads(r.read(8 << 20))
         return (data, r.headers) if with_headers else data
     except urllib.error.HTTPError as e:
+        if str(e.msg).startswith("redirect refused"):
+            raise RuntimeError(str(e.msg)[:150]) from None
         if e.code in (403, 429) and e.headers.get("X-RateLimit-Remaining") == "0":
             raise RuntimeError("GitHub API rate limit reached. Add a GitHub token in Admin.") from None
         raise RuntimeError(f"HTTP {e.code} from {urllib.parse.urlparse(url).netloc}") from None
@@ -1020,13 +1086,14 @@ def clean_tags(v):
         v = v.split(",")
     if not isinstance(v, list):
         raise ValueError("tags must be a list or comma-separated string")
-    out = []
+    out, seen = [], set()
     for t in v:
         t = re.sub(r"\s+", " ", str(t)).strip()[:30]
-        if t and t.lower() not in [x.lower() for x in out]:
+        if t and t.lower() not in seen:
+            if len(out) >= 20:
+                raise ValueError("at most 20 tags")
+            seen.add(t.lower())
             out.append(t)
-    if len(out) > 20:
-        raise ValueError("at most 20 tags")
     return out
 
 
@@ -1036,7 +1103,7 @@ def git_info(store, mid):
         return None
 
     def g(*a):
-        return subprocess.run(["git", *a], cwd=repo, env=GIT_ENV, capture_output=True, text=True, timeout=15).stdout
+        return subprocess.run(["git", *a], cwd=repo, env=GIT_ENV, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15).stdout
 
     try:
         refs = g("for-each-ref", "--format=%(refname)").split()
@@ -1519,7 +1586,7 @@ def detect_lfs(repo, prev):
     installed = bool(shutil.which("git-lfs"))
     try:
         if installed:
-            p = subprocess.run(["git", "lfs", "ls-files", "--all", "--size"], cwd=repo, env=GIT_ENV, capture_output=True, text=True, timeout=180)
+            p = subprocess.run(["git", "lfs", "ls-files", "--all", "--size"], cwd=repo, env=GIT_ENV, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=180)
             lines = [l for l in p.stdout.splitlines() if l.strip()]
             total = 0
             for l in lines:
@@ -1528,7 +1595,7 @@ def detect_lfs(repo, prev):
                     total += int(float(m.group(1)) * {"B": 1, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12}[m.group(2)])
             return {"time": now, "used": bool(lines), "files": len(lines), "bytes": total, "installed": True}
         g = subprocess.run(["git", "grep", "-q", "filter=lfs", "HEAD", "--", ".gitattributes", "*/.gitattributes"],
-                           cwd=repo, env=GIT_ENV, capture_output=True, timeout=60)
+                           cwd=repo, env=GIT_ENV, stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
         return {"time": now, "used": g.returncode == 0, "files": None, "bytes": None, "installed": False}
     except (subprocess.SubprocessError, OSError):
         return dict(prev or {"used": False}, time=now, unknown=True)
@@ -1575,14 +1642,16 @@ def paged(url, per, max_pages=30):
     raise RuntimeError(f"more than {max_pages * per} items; stopping")
 
 
-def download_asset(url, dest, cap_bytes):
-    """Stream to dest.part, abort over the cap. -> bytes written"""
+def download_asset(url, dest, cap_bytes, forge_host=None):
+    """Stream to dest.part, abort over the cap. -> bytes written.
+    The link was written by whoever maintains the mirrored project, so it may only reach the public internet, or the forge the
+    mirror came from (forge_host) when that forge is on a private network."""
     if not re.match(r"^https?://", url):
         raise RuntimeError("not an http(s) URL")
-    req = urllib.request.Request(url, headers={"User-Agent": "gitmirror"})
+    same_forge = bool(forge_host) and (urllib.parse.urlparse(url).hostname or "").lower() == forge_host.lower()
     n = 0
     os.makedirs(os.path.dirname(dest), exist_ok=True)
-    with urllib.request.urlopen(req, timeout=60) as r, open(dest + ".part", "wb") as f:
+    with open_url(url, {"User-Agent": "gitmirror"}, 60, allow_private=same_forge) as r, open(dest + ".part", "wb") as f:
         while True:
             chunk = r.read(1 << 20)
             if not chunk:
@@ -1603,6 +1672,7 @@ def sync_releases(store, mid, src, log):
     if not fr:
         return {"state": "error", "time": now, "msg": "Releases need a GitHub, GitLab or Gitea/Forgejo origin."}
     kind, api = fr
+    forge_host = urllib.parse.urlparse(api).hostname
     cap = CFG["_ref"]["release_asset_max_mb"] * (1 << 20)
     log.write("--- releases\n")
     try:
@@ -1627,7 +1697,7 @@ def sync_releases(store, mid, src, log):
                    url=rel["url"] if isinstance(rel["url"], str) and re.match(r"^https?://", rel["url"]) else None, assets=[])
         for a in assets:
             nm, url = safe_name(a.get("name"), "asset"), a.get("url")
-            item = {"name": nm, "size": _i(a.get("size")), "url": url if isinstance(url, str) else None, "local": None, "note": None}
+            item = {"name": nm, "size": _i(a.get("size")), "url": _http_url(url, 2000), "local": None, "note": None}
             local = os.path.join("releases", safe_name(tag, "tag"), nm)
             full = os.path.join(ed, local)
             if os.path.isfile(full) and (item["size"] is None or os.path.getsize(full) == item["size"]):
@@ -1642,7 +1712,7 @@ def sync_releases(store, mid, src, log):
                 item["note"] = "skipped: disk almost full"
             elif item["url"]:
                 try:
-                    nbytes += download_asset(item["url"], full, cap)
+                    nbytes += download_asset(item["url"], full, cap, forge_host)
                     item["local"] = local
                     dl += 1
                     log.write(f"downloaded {local}\n")
@@ -1770,11 +1840,13 @@ def norm_src(u):
     return u[:-4] if u.endswith(".git") else u
 
 
-def check_url(u, label):
+def check_url(u, label, admin=False):
     if not u:
         return
-    if u.startswith("-") or not URL_RE.match(u):
+    if u.startswith("-") or not URL_RE.match(u) or re.search(r"\s", u):
         raise ValueError(f"{label}: must be an http(s)://, ssh://, git://, file:// or user@host:path URL")
+    if u.lower().startswith("file://") and not (ALLOW_FILE_REMOTES or admin):
+        raise ValueError(f"{label}: file:// remotes need an admin (or GITMIRROR_ALLOW_FILE_REMOTES=1 for everyone who can add mirrors)")
 
 
 # ---- accounts, sessions, login throttling
@@ -1782,7 +1854,10 @@ SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 15, 8, 1
 SESSION_SECS = 30 * 24 * 3600
 USER_RE = re.compile(r"^[A-Za-z0-9_.@+-]{1,64}$")
 LOGIN_WINDOW, LOGIN_MAX, LOGIN_MAX_ALL = 600, 8, 60
-LOGIN_FAILS = {}
+LOGIN_FAILS = {}    # address -> times of failed password or setup-code attempts
+BEARER_MAX = 30     # wrong keys or tokens per address per window; separate from passwords so a bad sign-in never blocks scripts
+BEARER_FAILS = {}
+THROTTLE_LOCK = threading.Lock()
 
 
 def _b64(b):
@@ -1818,24 +1893,46 @@ def check_new_password(password):
         raise ValueError("Password must be 8 to 256 characters")
 
 
-def login_wait(ip):
-    """Seconds this client must wait before another attempt (0 = go ahead)."""
+def _wait(bucket, ip, limit, global_limit):
     now = time.time()
-    mine = [t for t in LOGIN_FAILS.get(ip, []) if now - t < LOGIN_WINDOW]
-    LOGIN_FAILS[ip] = mine
-    allf = [t for lst in LOGIN_FAILS.values() for t in lst]
-    if len(mine) >= LOGIN_MAX:
-        return int(LOGIN_WINDOW - (now - mine[0])) + 1
-    if len(allf) >= LOGIN_MAX_ALL:
-        return int(LOGIN_WINDOW - (now - min(allf))) + 1
+    with THROTTLE_LOCK:
+        mine = [t for t in bucket.get(ip, []) if now - t < LOGIN_WINDOW]
+        bucket[ip] = mine
+        if len(mine) >= limit:
+            return int(LOGIN_WINDOW - (now - mine[0])) + 1
+        if global_limit:
+            allf = [t for lst in bucket.values() for t in lst if now - t < LOGIN_WINDOW]
+            if len(allf) >= global_limit:
+                return int(LOGIN_WINDOW - (now - min(allf))) + 1
     return 0
 
 
+def _failed(bucket, ip):
+    now = time.time()
+    with THROTTLE_LOCK:
+        bucket.setdefault(ip, []).append(now)
+        if len(bucket) > 2000:  # never let a flood of addresses grow this without bound
+            for k in [k for k, v in bucket.items() if not v or now - v[-1] > LOGIN_WINDOW]:
+                bucket.pop(k, None)
+
+
+def login_wait(ip):
+    """Seconds this client must wait before another password or setup-code attempt (0 = go ahead)."""
+    return _wait(LOGIN_FAILS, ip, LOGIN_MAX, LOGIN_MAX_ALL)
+
+
 def login_failed(ip):
-    LOGIN_FAILS.setdefault(ip, []).append(time.time())
-    if len(LOGIN_FAILS) > 2000:  # never let a flood of addresses grow this without bound
-        for k in [k for k, v in LOGIN_FAILS.items() if not v or time.time() - v[-1] > LOGIN_WINDOW]:
-            LOGIN_FAILS.pop(k, None)
+    _failed(LOGIN_FAILS, ip)
+
+
+def bearer_wait(ip):
+    """Seconds before this address may present another API key or script token. Keys are 256 random bits, so the limit is
+    generous, per address only, and untouched by failed sign-ins: a stranger guessing passwords can't take the API down."""
+    return _wait(BEARER_FAILS, ip, BEARER_MAX, None)
+
+
+def bearer_failed(ip):
+    _failed(BEARER_FAILS, ip)
 
 
 _DUMMY_HASH = []
@@ -1857,7 +1954,9 @@ def required_role(method, path, body=None):
     if method == "GET":
         if re.fullmatch(r"/|/events|/account|/maintenance(/\w+)?|/sources|/source/\w+|/repo/\w+", path):
             return "viewer"
-        if re.fullmatch(r"/api/(mirrors|stats|summary|history|events|maintenance|sources|settings|version|keys|auth/me)|"
+        if path == "/api/settings":
+            return "operator"  # retry, timeout and LFS policy: not needed to read the mirrors
+        if re.fullmatch(r"/api/(mirrors|stats|summary|history|events|maintenance|sources|version|keys|auth/me)|"
                         r"/api/mirrors/\w+(/(log|extras))?|/api/sources/\w+|/dl/\w+/releases/[^/]+/[^/]+", path):
             return "viewer"
         return "admin"  # /admin, /api/export, /api/users, /api/audit and anything unknown
@@ -1933,10 +2032,11 @@ def key_hash(token):
 
 def find_key(store, token):
     h = key_hash(token)
-    for ukey, u in store.users.items():
-        for k in u.get("keys", []):
-            if hmac.compare_digest(k["hash"], h):
-                return ukey, u, k
+    with store.lock:  # an admin may be adding a user or a key while we iterate
+        for ukey, u in store.users.items():
+            for k in u.get("keys", []):
+                if hmac.compare_digest(k["hash"], h):
+                    return ukey, u, k
     return None
 
 
@@ -2019,7 +2119,7 @@ def check_update(store):
     """Ask GitHub which version tags exist (git ls-remote: no API quota, no login). Never raises."""
     info = {"checked": time.time(), "latest": None, "error": ""}
     try:
-        p = subprocess.run(["git", "ls-remote", "--tags", "--refs", REPO_URL + ".git"], env=GIT_ENV, capture_output=True, text=True, timeout=30)
+        p = subprocess.run(["git", "ls-remote", "--tags", "--refs", REPO_URL + ".git"], env=GIT_ENV, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
         if p.returncode:
             raise RuntimeError((p.stderr.strip().splitlines() or ["git ls-remote failed"])[-1][:150])
         tags = [l.split("refs/tags/", 1)[1] for l in p.stdout.splitlines() if "refs/tags/" in l]
@@ -2088,11 +2188,15 @@ class Handler(BaseHTTPRequestHandler):
     timeout = 30  # seconds a client may stall mid-request before its connection is dropped
     store = None
     server_version = "gitmirror"
+    sys_version = ""  # don't advertise the Python version
     _role = "viewer"  # role of the current request; pages use it to hide what the user may not do
     _audit = None     # (identity, method, path, target, note) of a change to record once it succeeded
 
     def log_message(self, *a):
         pass
+
+    def version_string(self):
+        return self.server_version  # the default appends sys_version with a space even when it is empty
 
     def client_ip(self):
         return client_ip(self.client_address[0], self.headers.get("X-Forwarded-For"), TRUSTED_PROXIES)
@@ -2154,7 +2258,7 @@ class Handler(BaseHTTPRequestHandler):
             if u.get("disabled") or (k.get("expires") and k["expires"] <= now):
                 return None
             ip = self.client_ip()
-            if not k.get("last_used") or now - k["last_used"] > KEY_TOUCH_SECS or k.get("last_ip") != ip:
+            if not k.get("last_used") or now - k["last_used"] > KEY_TOUCH_SECS:  # time only: an address that flips must not rewrite auth.json per request
                 with self.store.lock:
                     k["last_used"], k["last_ip"] = now, ip
                     self.store.save_auth()
@@ -2168,6 +2272,16 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def route(self, method):
+        try:
+            self._route(method)
+        except Exception as e:  # never a traceback to the log per request, never a dropped connection: one line and a JSON 500
+            print(f"ERROR {method} {urlparse(self.path).path}: {type(e).__name__}: {str(e)[:200]}", file=sys.stderr, flush=True)
+            try:
+                self.send(500, {"error": "internal error"})
+            except Exception:
+                pass
+
+    def _route(self, method):
         if urlparse(self.path).path == "/healthz":  # for Docker / uptime checks, so it needs no login
             ok = time.time() - self.store.heartbeat < 90 and os.access(self.store.data, os.W_OK)
             return self.send(200 if ok else 503, {"ok": ok, "version": __version__})
@@ -2190,7 +2304,7 @@ class Handler(BaseHTTPRequestHandler):
         if n:
             try:
                 body = json.loads(self.rfile.read(min(n, 1 << 20)))
-            except ValueError:
+            except (ValueError, RecursionError):  # RecursionError: thousands of nested brackets
                 return self.send(400, {"error": "bad json"})
             if not isinstance(body, dict):
                 return self.send(400, {"error": "body must be a JSON object"})
@@ -2245,13 +2359,13 @@ class Handler(BaseHTTPRequestHandler):
 
         bearer = (self.headers.get("Authorization") or "").startswith("Bearer ")
         if bearer:
-            wait = login_wait(ip)
+            wait = bearer_wait(ip)
             if wait:
                 return self.send(429, {"error": f"Too many failed attempts. Try again in {wait} seconds."}, headers={"Retry-After": str(wait)})
         ident = self.identity()
         if not ident:
             if bearer:
-                login_failed(ip)
+                bearer_failed(ip)
             if method == "GET" and not path.startswith(("/api/", "/dl/")):
                 return self.redirect("/setup" if not st.users else "/login")
             return self.send(401, {"error": "unauthorized", "setup_required": not st.users})
@@ -2455,7 +2569,7 @@ class Handler(BaseHTTPRequestHandler):
                         if not lo <= v <= hi:
                             raise ValueError(f"{k} must be between {lo} and {hi}")
                         new[k] = v
-            except (ValueError, TypeError) as e:
+            except (ValueError, TypeError, OverflowError) as e:  # OverflowError: 1e400 and friends
                 return self.send(400, {"error": str(e)})
             with st.lock:
                 st.settings.update(new)
@@ -2466,8 +2580,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, [public(m, st) for m in st.mirrors])
         if method == "POST" and path == "/api/mirrors":
             try:
-                src = normalize_url(body.get("source", "").strip())
-                check_url(src, "source")
+                src = normalize_url(str(body.get("source") or "").strip())
+                check_url(src, "source", self._role == "admin")
                 if not src:
                     raise ValueError("source is required")
                 iv = body.get("interval")
@@ -2604,6 +2718,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, json.dumps(out, indent=2).encode(), headers={"Content-Disposition": "attachment; filename=gitmirror-export.json"})
         if method == "POST" and path == "/api/import":
             res = {"mirrors_added": 0, "mirrors_existing": 0, "skipped": [], "sources_added": 0}
+            if not isinstance(body.get("mirrors", []), list) or not isinstance(body.get("sources", []), list):
+                return self.send(400, {"error": "mirrors and sources must be lists"})
             with st.lock:
                 have = {norm_src(x["source"]) for x in st.mirrors}
                 have_src = {x["url"] for x in st.sources}
@@ -2612,7 +2728,7 @@ class Handler(BaseHTTPRequestHandler):
                     src = str(d.get("source", "")).strip()
                     if "***" in src:
                         raise ValueError("credentials were masked in the export")
-                    check_url(src, "source")
+                    check_url(src, "source", self._role == "admin")
                     if not src:
                         raise ValueError("no source")
                     if norm_src(src) in have:
@@ -3052,7 +3168,7 @@ pop.onclick=e=>e.stopPropagation();
 document.addEventListener('click',()=>{pop.hidden=true;$('#thbtn').setAttribute('aria-expanded','false')});
 document.addEventListener('keydown',e=>{if(e.key=='Escape'){pop.hidden=true;$('#thbtn').focus()}});
 
-api('/settings').then(r=>r.json()).then(s=>{const i=document.querySelector('[name=interval]');i.defaultValue=i.value=s.default_interval_text;const h=document.querySelector('[name=hold]');h.defaultChecked=h.checked=!!s.hold_default});
+api('/settings').then(r=>r.ok?r.json():null).then(s=>{if(!s)return;const i=document.querySelector('[name=interval]');i.defaultValue=i.value=s.default_interval_text;const h=document.querySelector('[name=hold]');h.defaultChecked=h.checked=!!s.hold_default});
 load();setInterval(load,3000);
 </script></html>"""
 
