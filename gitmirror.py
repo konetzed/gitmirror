@@ -51,14 +51,20 @@ def parse_interval(v):
         mins = v
     else:
         t = str(v).strip().upper().replace(" ", "")
+        bad = ValueError("interval must look like 1W, 3D, 12H, 30M or 1D12H (0 = manual only)")
+        if len(t) > 40:
+            raise bad
         if t.isdigit():
             mins = int(t)
         else:
-            m = re.fullmatch(r"(?:(\d+)W)?(?:(\d+)D)?(?:(\d+)H)?(?:(\d+)M)?", t)
-            if not t or not m:
-                raise ValueError("interval must look like 1W, 3D, 12H, 30M or 1D12H (0 = manual only)")
-            w, d, h, mi = (int(x or 0) for x in m.groups())
-            mins = ((w * 7 + d) * 24 + h) * 60 + mi
+            if not re.fullmatch(r"(?:\d+[WDHM])+", t):  # unambiguous (digits, then one unit letter), so no backtracking blow-up
+                raise bad
+            parts = re.findall(r"(\d+)([WDHM])", t)
+            units = [u for _, u in parts]
+            if units != sorted(set(units), key="WDHM".index):  # each unit at most once, in W D H M order
+                raise bad
+            n = {u: int(d) for d, u in parts}
+            mins = ((n.get("W", 0) * 7 + n.get("D", 0)) * 24 + n.get("H", 0)) * 60 + n.get("M", 0)
     if not 0 <= mins <= 525600:
         raise ValueError("interval must be between 0 and 1 year")
     return mins
@@ -944,10 +950,16 @@ ACCT_CACHE = {}  # url -> (time, acct, repos): the preview and the create step s
 
 
 def parse_acct_url(url):
-    m = re.match(r"^(https?)://([^/@]+)(/[^?#]*)?[?#]?.*$", (url or "").strip())
-    if not m:
+    u = (url or "").strip()
+    if len(u) > 2000:
         return None
-    return m.group(1), m.group(2), [x for x in (m.group(3) or "").split("/") if x]
+    try:
+        p = urllib.parse.urlsplit(u)
+    except ValueError:
+        return None
+    if p.scheme not in ("http", "https") or not p.netloc or "@" in p.netloc:
+        return None
+    return p.scheme, p.netloc, [x for x in p.path.split("/") if x]
 
 
 def is_account_url(url):
@@ -1308,6 +1320,11 @@ def safe_name(n, default="file"):
     return (ASSET_NAME_RE.sub("_", str(n)).strip(" .")[:120]) or default
 
 
+def header_filename(name):
+    """File name for a Content-Disposition header: printable ASCII only, so no header injection is possible."""
+    return re.sub(r"[^A-Za-z0-9._+ -]", "_", str(name).replace("\r", "").replace("\n", ""))[:120] or "download"
+
+
 def mirror_size(store, mid):
     return sum(dir_size(d) for d in (store.path(mid), store.wiki_path(mid), store.extras_dir(mid)))
 
@@ -1600,8 +1617,9 @@ def create_mirror(store, src, name="", tags=None, interval=None, hold=None, sour
 
 def norm_src(u):
     """Comparable form of a clone URL, so the same repo is recognised however it was typed."""
-    u = re.sub(r"^(https?://)[^/@]+@", r"\1", (u or "").strip().lower())
-    return re.sub(r"(\.git)?/*$", "", u)
+    u = re.sub(r"^(https?://)[^/@]+@", r"\1", (u or "").strip().lower()[:2000])
+    u = u.rstrip("/")
+    return u[:-4] if u.endswith(".git") else u
 
 
 def check_url(u, label):
@@ -1746,7 +1764,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(os.path.getsize(full)))
-            self.send_header("Content-Disposition", 'attachment; filename="%s"' % safe_name(os.path.basename(full)))
+            self.send_header("Content-Disposition", 'attachment; filename="%s"' % header_filename(os.path.basename(full)))
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             with open(full, "rb") as f:
