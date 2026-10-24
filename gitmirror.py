@@ -31,6 +31,10 @@ from urllib.parse import urlparse, parse_qs
 __version__ = "0.0.1-beta"
 REPO_URL = "https://github.com/konetzed/gitmirror"
 API_TOKEN = os.environ.get("GITMIRROR_TOKEN", "")  # optional: setup code for the first account, and a Bearer token for scripts
+ROLES = ("viewer", "operator", "admin")  # lowest to highest
+TOKEN_ROLE = os.environ.get("GITMIRROR_TOKEN_ROLE", "operator").strip().lower()
+if TOKEN_ROLE not in ("viewer", "operator"):  # the script token is never an admin
+    TOKEN_ROLE = "operator"
 URL_RE = re.compile(r"^(https?://|ssh://|git://|file://|[\w.-]+@[\w.-]+:)")
 GIT_ENV = {
     **os.environ,
@@ -127,9 +131,19 @@ class Store:
         self.sources = load_json(self.sources_path) if os.path.exists(self.sources_path) else []
         self.scanning = set()
         self.auth_path = os.path.join(self.cfg_dir, "auth.json")
-        self.auth = load_json(self.auth_path) if os.path.exists(self.auth_path) else {}
+        raw = load_json(self.auth_path) if os.path.exists(self.auth_path) else {}
+        if "users" in raw:
+            self.users = raw["users"]
+        elif raw.get("user") and raw.get("hash"):  # the single account from before roles existed becomes the admin
+            self.users = {raw["user"].casefold(): {"name": raw["user"], "hash": raw["hash"], "role": "admin", "created": raw.get("created", time.time())}}
+        else:
+            self.users = {}
+        self.audit_path = os.path.join(self.cfg_dir, "audit.json")
+        self.audit = load_json(self.audit_path) if os.path.exists(self.audit_path) else []
         self.sessions_path = os.path.join(self.cfg_dir, "sessions.json")
         self.sessions = load_json(self.sessions_path) if os.path.exists(self.sessions_path) else {}
+        if self.users and "users" not in raw:
+            self.save_auth()
         self.update_info = {"checked": 0, "latest": None, "error": ""}
         self.heartbeat = time.time()
         self.history_path = os.path.join(self.cfg_dir, "history.json")
@@ -153,7 +167,10 @@ class Store:
         os.replace(tmp, path)
 
     def save_auth(self):
-        self._write_private(self.auth_path, self.auth)
+        self._write_private(self.auth_path, {"users": self.users})
+
+    def save_audit(self):
+        self._write_private(self.audit_path, self.audit)
 
     def save_sessions(self):
         self._write_private(self.sessions_path, self.sessions)
@@ -986,7 +1003,7 @@ const apply=()=>{let mode=g('theme')||D.mode;if(mode!='light'&&mode!='dark')mode
  const hc=mm('(prefers-contrast:more)'),L=g('light')||(hc&&D.light=='light'?'hc-light':D.light),K=g('dark')||(hc&&D.dark=='dark'?'hc-dark':D.dark),cb=g('cb');
  r.dataset.mode=mode;r.dataset.theme=mode=='dark'?K:L;if(cb===null?D.cb:cb=='1')r.dataset.cb='1';else delete r.dataset.cb;
  return{mode,L,K,cb:r.dataset.cb=='1'}};
-window.GM={D,apply,set:(k,v)=>{try{v==null?localStorage.removeItem('gm-'+k):localStorage.setItem('gm-'+k,v)}catch(e){}}};apply()})()</script>
+window.GM={D,apply,set:(k,v)=>{try{v==null?localStorage.removeItem('gm-'+k):localStorage.setItem('gm-'+k,v)}catch(e){}}};apply();r.dataset.role="__ROLE__"})()</script>
 """
 
 
@@ -1741,6 +1758,100 @@ def login_failed(ip):
             LOGIN_FAILS.pop(k, None)
 
 
+_DUMMY_HASH = []
+
+
+def dummy_hash():
+    """A real hash to check against when the user name is unknown, so timing doesn't reveal which names exist."""
+    if not _DUMMY_HASH:
+        _DUMMY_HASH.append(hash_password("not a real password"))
+    return _DUMMY_HASH[0]
+
+
+def role_rank(role):
+    return ROLES.index(role) if role in ROLES else -1
+
+
+def required_role(method, path, body=None):
+    """The lowest role allowed to make this request. Anything not listed here needs an admin (deny by default)."""
+    if method == "GET":
+        if re.fullmatch(r"/|/events|/maintenance(/\w+)?|/sources|/source/\w+|/repo/\w+", path):
+            return "viewer"
+        if re.fullmatch(r"/api/(mirrors|stats|summary|history|events|maintenance|sources|settings|version|auth/me)|"
+                        r"/api/mirrors/\w+(/(log|extras))?|/api/sources/\w+|/dl/\w+/releases/[^/]+/[^/]+", path):
+            return "viewer"
+        return "admin"  # /admin, /api/export, /api/users, /api/audit and anything unknown
+    if method == "POST":
+        if path in ("/api/auth/logout", "/api/auth/password"):
+            return "viewer"  # acts on your own session and password
+        if path == "/api/bulk":
+            return "admin" if (body or {}).get("action") == "delete" else "operator"
+        if re.fullmatch(r"/api/(mirrors|sources|sources/preview|maintenance/(verify|optimize)|version/check)|"
+                        r"/api/mirrors/\w+/(sync|toggle|meta|ack|hold|accept|reject|verify|lfs)|"
+                        r"/api/sources/\w+/(rescan|approve|skip|ack)", path):
+            return "operator"
+        return "admin"  # /api/import, /api/users and anything unknown
+    if method == "PUT":
+        if re.fullmatch(r"/api/(mirrors|sources)/\w+", path):
+            return "operator"
+        return "admin"  # /api/settings, /api/users/<name>
+    return "admin"  # DELETE and anything else: removing mirrors, sources or users
+
+
+AUDIT_SKIP = ("/api/auth/logout", "/api/version/check")
+
+
+def audit_target(store, path, body):
+    m = re.match(r"^/api/mirrors/(\w+)", path)
+    if m:
+        mm = store.get(m.group(1))
+        return mm["name"] if mm else m.group(1)
+    m = re.match(r"^/api/sources/(\w+)", path)
+    if m:
+        src = store.source(m.group(1))
+        return src["name"] if src else m.group(1)
+    m = re.match(r"^/api/users/([^/]+)", path)
+    if m:
+        return urllib.parse.unquote(m.group(1))
+    if path == "/api/users" and isinstance(body, dict):
+        return str(body.get("username", ""))[:64]
+    return ""
+
+
+def audit_note(path, body):
+    if not isinstance(body, dict):
+        return ""
+    if path == "/api/bulk":
+        return f"{body.get('action')} on {len(body.get('ids') or [])} mirrors"
+    if path == "/api/settings":
+        return "changed: " + ", ".join(sorted(k for k in body if k not in ("github_token",)))[:200] + (", github_token" if "github_token" in body else "")
+    if path.startswith("/api/users"):
+        return ", ".join(f"{k}={body[k]}" for k in ("role", "disabled") if k in body) + (" password reset" if "password" in body else "")
+    return ""
+
+
+def audit_add(store, ident, method, path, target, note):
+    entry = {"t": time.time(), "user": ident.get("name") or "script token", "role": ident["role"],
+             "what": f"{method} " + re.sub(r"/[0-9a-f]{10}\b", "/:id", path), "target": target, "note": note}
+    with store.lock:
+        store.audit.append(entry)
+        del store.audit[:-1000]
+        try:
+            store.save_audit()
+        except OSError:
+            pass
+
+
+def end_user_sessions(store, key):
+    with store.lock:
+        store.sessions = {h: x for h, x in store.sessions.items() if str(x.get("user", "")).casefold() != key}
+        store.save_sessions()
+
+
+def active_admins(users, ignore=None):
+    return [k for k, u in users.items() if u.get("role") == "admin" and not u.get("disabled") and k != ignore]
+
+
 def new_session(store, user, agent=""):
     tok = secrets.token_urlsafe(32)
     now = time.time()
@@ -1818,6 +1929,8 @@ class Handler(BaseHTTPRequestHandler):
     timeout = 30  # seconds a client may stall mid-request before its connection is dropped
     store = None
     server_version = "gitmirror"
+    _role = "viewer"  # role of the current request; pages use it to hide what the user may not do
+    _audit = None     # (identity, method, path, target, note) of a change to record once it succeeded
 
     def log_message(self, *a):
         pass
@@ -1825,10 +1938,13 @@ class Handler(BaseHTTPRequestHandler):
     def send(self, code, body, ctype="application/json", headers=None):
         if ctype == "text/html":
             cfg = self.store.settings
-            body = body.replace("__THEME_DEFAULTS__", json.dumps({
+            body = body.replace("__ROLE__", self._role).replace("__THEME_DEFAULTS__", json.dumps({
                 "mode": cfg.get("theme", "auto"), "light": cfg.get("light_theme", "light"),
                 "dark": cfg.get("dark_theme", "dark"), "cb": bool(cfg.get("colorblind"))}))
         b = body if isinstance(body, bytes) else (json.dumps(body) if ctype == "application/json" else body).encode()
+        if self._audit and code < 400:  # recorded before the client sees the success, so a follow-up request always finds it
+            audit_add(self.store, *self._audit)
+        self._audit = None
         self.send_response(code)
         self.send_header("Content-Type", ctype + "; charset=utf-8")
         self.send_header("Content-Length", str(len(b)))
@@ -1863,13 +1979,16 @@ class Handler(BaseHTTPRequestHandler):
         return {"Set-Cookie": f"gm_session={tok or ''}; Path=/; HttpOnly; SameSite=Strict; Max-Age={age}{secure}"}
 
     def identity(self):
-        """('token', None) for the Bearer token, ('session', name) for a logged-in browser, or None."""
+        """{'via': 'token'|'session', 'name', 'key', 'role'} for the Bearer token or a signed-in browser, else None."""
         ah = self.headers.get("Authorization") or ""
         if API_TOKEN and ah.startswith("Bearer ") and hmac.compare_digest(ah[7:].encode(), API_TOKEN.encode()):
-            return ("token", None)
+            return {"via": "token", "name": None, "key": None, "role": TOKEN_ROLE}
         tok = self.cookie("gm_session")
-        user = session_user(self.store, tok) if tok else None
-        return ("session", user) if user else None
+        key = session_user(self.store, tok) if tok else None
+        u = self.store.users.get(str(key).casefold()) if key else None  # the role is read fresh every time, so a change applies at once
+        if u and not u.get("disabled"):
+            return {"via": "session", "name": u["name"], "key": str(key).casefold(), "role": u["role"]}
+        return None
 
     def route(self, method):
         if urlparse(self.path).path == "/healthz":  # for Docker / uptime checks, so it needs no login
@@ -1900,19 +2019,20 @@ class Handler(BaseHTTPRequestHandler):
 
         # ---- sign-in: the only routes that work without being logged in
         ip = self.client_address[0]
+        self._role, self._audit = "viewer", None
         if method == "GET" and path in ("/login", "/setup"):
             if path == "/login" and self.identity():
                 return self.redirect("/")
-            if (path == "/setup") != (not st.auth):
-                return self.redirect("/setup" if not st.auth else "/login")
+            if (path == "/setup") != (not st.users):
+                return self.redirect("/setup" if not st.users else "/login")
             return self.send(200, LOGIN if path == "/login" else SETUP, "text/html")
         if method == "GET" and path == "/api/auth/status":
-            return self.send(200, {"setup_required": not st.auth, "setup_code_required": bool(API_TOKEN) and not st.auth})
+            return self.send(200, {"setup_required": not st.users, "setup_code_required": bool(API_TOKEN) and not st.users})
         if method == "POST" and path == "/api/auth/setup":
             wait = login_wait(ip)
             if wait:
                 return self.send(429, {"error": f"Too many attempts. Try again in {wait} seconds."}, headers={"Retry-After": str(wait)})
-            if st.auth:
+            if st.users:
                 return self.send(403, {"error": "An account already exists. Sign in instead."})
             if API_TOKEN and not hmac.compare_digest(str(body.get("setup_code", "")).encode(), API_TOKEN.encode()):
                 login_failed(ip)
@@ -1924,32 +2044,41 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(400, {"error": str(e)})
             digest = hash_password(pw)
             with st.lock:
-                if st.auth:
+                if st.users:
                     return self.send(409, {"error": "An account was just created. Sign in instead."})
-                st.auth = {"user": name, "hash": digest, "created": time.time()}
+                st.users = {name.casefold(): {"name": name, "hash": digest, "role": "admin", "created": time.time()}}  # the first user is always an admin
                 st.save_auth()
-            return self.send(200, {"ok": True}, headers=self.session_header(new_session(st, name, self.headers.get("User-Agent", ""))))
+            return self.send(200, {"ok": True}, headers=self.session_header(new_session(st, name.casefold(), self.headers.get("User-Agent", ""))))
         if method == "POST" and path == "/api/auth/login":
-            if not st.auth:
+            if not st.users:
                 return self.send(409, {"error": "No account yet. Open /setup first."})
             wait = login_wait(ip)
             if wait:
                 return self.send(429, {"error": f"Too many failed attempts. Try again in {wait} seconds."}, headers={"Retry-After": str(wait)})
             name, pw = body.get("username"), body.get("password")
             name, pw = (name if isinstance(name, str) else ""), (pw if isinstance(pw, str) else "")
-            pw_ok = verify_password(pw[:256], st.auth["hash"])  # always run the slow hash, so timing doesn't reveal a wrong user name
-            user_ok = hmac.compare_digest(name.casefold().encode(), st.auth["user"].casefold().encode())
-            if not (pw_ok and user_ok):
+            u = st.users.get(name.casefold())
+            pw_ok = verify_password(pw[:256], u["hash"] if u else dummy_hash())  # always run the slow hash: timing must not reveal which names exist
+            if not (u and pw_ok and not u.get("disabled")):
                 login_failed(ip)
                 return self.send(401, {"error": "Wrong username or password."})
             LOGIN_FAILS.pop(ip, None)
-            return self.send(200, {"ok": True}, headers=self.session_header(new_session(st, st.auth["user"], self.headers.get("User-Agent", ""))))
+            return self.send(200, {"ok": True}, headers=self.session_header(new_session(st, name.casefold(), self.headers.get("User-Agent", ""))))
 
         ident = self.identity()
         if not ident:
             if method == "GET" and not path.startswith(("/api/", "/dl/")):
-                return self.redirect("/setup" if not st.auth else "/login")
-            return self.send(401, {"error": "unauthorized", "setup_required": not st.auth})
+                return self.redirect("/setup" if not st.users else "/login")
+            return self.send(401, {"error": "unauthorized", "setup_required": not st.users})
+        self._role = ident["role"]
+        need = required_role(method, path, body)
+        if role_rank(ident["role"]) < role_rank(need):
+            if method == "GET" and not path.startswith(("/api/", "/dl/")):
+                return self.redirect("/")  # a page this role may not open
+            return self.send(403, {"error": f"Your role ({ident['role']}) can't do this; it needs {need}."})
+        if method != "GET" and path not in AUDIT_SKIP:
+            self._audit = (ident, method, path, audit_target(st, path, body), audit_note(path, body))
+
         if method == "POST" and path == "/api/auth/logout":
             tok = self.cookie("gm_session")
             if tok:
@@ -1958,15 +2087,16 @@ class Handler(BaseHTTPRequestHandler):
                     st.save_sessions()
             return self.send(200, {"ok": True}, headers=self.session_header(None))
         if method == "GET" and path == "/api/auth/me":
-            return self.send(200, {"user": ident[1], "via": ident[0]})
+            return self.send(200, {"user": ident["name"], "role": ident["role"], "via": ident["via"]})
         if method == "POST" and path == "/api/auth/password":
-            if ident[0] != "session":
+            if ident["via"] != "session":
                 return self.send(403, {"error": "Change the password from a signed-in browser."})
             wait = login_wait(ip)
             if wait:
                 return self.send(429, {"error": f"Too many failed attempts. Try again in {wait} seconds."}, headers={"Retry-After": str(wait)})
+            me = st.users[ident["key"]]
             cur, new = body.get("current"), body.get("new")
-            if not isinstance(cur, str) or not verify_password(cur[:256], st.auth["hash"]):
+            if not isinstance(cur, str) or not verify_password(cur[:256], me["hash"]):
                 login_failed(ip)
                 return self.send(403, {"error": "Current password is wrong."})
             try:
@@ -1975,10 +2105,80 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(400, {"error": str(e)})
             digest = hash_password(new)
             with st.lock:
-                st.auth["hash"] = digest
+                me["hash"] = digest
                 st.save_auth()
-            end_sessions(st)  # every other browser has to sign in again
-            return self.send(200, {"ok": True}, headers=self.session_header(new_session(st, ident[1], self.headers.get("User-Agent", ""))))
+            end_user_sessions(st, ident["key"])  # that user's other browsers have to sign in again
+            return self.send(200, {"ok": True}, headers=self.session_header(new_session(st, ident["key"], self.headers.get("User-Agent", ""))))
+
+        # ---- users and the activity log (admins only; required_role denies everything else by default)
+        mu = re.match(r"^/api/users(?:/([^/]+))?$", path)
+        if mu:
+            key = urllib.parse.unquote(mu.group(1)).casefold() if mu.group(1) else None
+            if key is None and method == "GET":
+                with st.lock:
+                    now = time.time()
+                    return self.send(200, [{"name": u["name"], "key": k, "role": u["role"], "disabled": bool(u.get("disabled")), "created": u.get("created"),
+                                            "signed_in": sum(1 for x in st.sessions.values() if str(x.get("user", "")).casefold() == k and x["exp"] > now)}
+                                           for k, u in sorted(st.users.items())])
+            if key is None and method == "POST":
+                try:
+                    name, pw, role = body.get("username"), body.get("password"), body.get("role", "viewer")
+                    check_new_credentials(name, pw)
+                    if role not in ROLES:
+                        raise ValueError("Role must be viewer, operator or admin")
+                except ValueError as e:
+                    return self.send(400, {"error": str(e)})
+                digest = hash_password(pw)
+                with st.lock:
+                    if name.casefold() in st.users:
+                        return self.send(409, {"error": "That user name is taken"})
+                    st.users[name.casefold()] = {"name": name, "hash": digest, "role": role, "created": time.time(), "created_by": ident["name"]}
+                    st.save_auth()
+                return self.send(201, {"ok": True})
+            u = st.users.get(key) if key else None
+            if key is None or not u:
+                return self.send(404, {"error": "no such user"})
+            if method == "PUT":
+                new = {}
+                try:
+                    if "role" in body:
+                        if body["role"] not in ROLES:
+                            raise ValueError("Role must be viewer, operator or admin")
+                        new["role"] = body["role"]
+                    if "disabled" in body:
+                        new["disabled"] = bool(body["disabled"])
+                    if "password" in body:
+                        if key == ident["key"]:
+                            raise ValueError("Change your own password from the Account card instead")
+                        check_new_password(body["password"])
+                except ValueError as e:
+                    return self.send(400, {"error": str(e)})
+                digest = hash_password(body["password"]) if "password" in body else None
+                with st.lock:
+                    after = dict(st.users, **{key: dict(u, **new)})
+                    if not active_admins(after):
+                        return self.send(409, {"error": "Keep at least one active admin"})
+                    u.update(new)
+                    if digest:
+                        u["hash"] = digest
+                    st.save_auth()
+                if new.get("disabled") or digest:
+                    end_user_sessions(st, key)  # a disabled or reset account is signed out everywhere; a new role simply applies from the next request
+                return self.send(200, {"ok": True})
+            if method == "DELETE":
+                if key == ident["key"]:
+                    return self.send(409, {"error": "You can't delete your own account"})
+                with st.lock:
+                    if not active_admins(st.users, ignore=key):
+                        return self.send(409, {"error": "Keep at least one active admin"})
+                    st.users.pop(key)
+                    st.save_auth()
+                end_user_sessions(st, key)
+                return self.send(200, {"ok": True})
+        if method == "GET" and path == "/api/audit":
+            with st.lock:
+                return self.send(200, list(reversed(st.audit[-200:])))
+
         if method == "GET" and path == "/api/version":
             return self.send(200, version_out(st))
         if method == "POST" and path == "/api/version/check":
@@ -2500,6 +2700,8 @@ th{color:var(--mut);font-weight:500;white-space:nowrap}td.n{white-space:nowrap}.
 .tgl .kn{position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:var(--card);box-shadow:0 1px 3px #0006;transition:transform .2s}
 .tgl input:checked~.kn{transform:translateX(28px)}.tgl input:focus-visible~.tr{outline:2px solid var(--acc);outline-offset:2px}
 select{width:100%;padding:8px;border:1px solid var(--bd);border-radius:6px;background:var(--bg);color:var(--fg);margin-top:4px}
+html[data-role=viewer] .op,html[data-role=viewer] .adm,html[data-role=operator] .adm{display:none!important}
+html[data-role=viewer] #tags .chip b{display:none}html[data-role=viewer] #exbox{pointer-events:none;opacity:.6}
 .brand{color:inherit;text-decoration:none}.brand:hover{text-decoration:underline}
 .chip{display:inline-block;padding:1px 9px;border-radius:999px;border:1px solid var(--bd);font-size:12px;background:var(--bg);cursor:pointer}
 .chip.on{background:var(--acc);border-color:var(--acc);color:var(--onacc)}.chip b{margin-left:4px;opacity:.6}
@@ -2510,7 +2712,7 @@ dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 16px;margin:0}dt{c
 PAGE = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Git Mirror</title>
 <style>__STYLE__</style>
-<main><div class=row style="position:relative"><h1><a class=brand href="https://github.com/konetzed/gitmirror" target=_blank rel="noopener noreferrer" title="gitmirror on GitHub">Git Mirror</a></h1><span class=mut id=ver></span><span class=sp></span><a data-nav href="/events">Events</a><a data-nav href="/sources">Sources</a><a data-nav href="/maintenance">Maintenance</a><a data-nav href="/admin">Admin</a>
+<main><div class=row style="position:relative"><h1><a class=brand href="https://github.com/konetzed/gitmirror" target=_blank rel="noopener noreferrer" title="gitmirror on GitHub">Git Mirror</a></h1><span class=mut id=ver></span><span class=sp></span><a data-nav href="/events">Events</a><a data-nav href="/sources">Sources</a><a data-nav href="/maintenance">Maintenance</a><a class=adm data-nav href="/admin">Admin</a>
 <button class=icon id=thbtn title="Theme options" aria-haspopup=true aria-expanded=false>🎨</button>
 <label class=tgl title="Light / dark"><input type=checkbox id=themetgl aria-label="Dark mode"><span class=tr><span>☀</span><span>☾</span></span><span class=kn></span></label><a href="#" id=logout>Log out</a>
 <div class=pop id=thpop hidden>
@@ -2518,7 +2720,7 @@ PAGE = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport 
 <label class=cap>☾ Moon (dark) theme<select id=thd><option value=dark>Dark</option><option value=oled>OLED black</option><option value=hc-dark>High contrast dark</option></select></label>
 <label class=row style="gap:8px"><input type=checkbox id=thcb style="width:auto"> Colorblind-safe colours</label>
 <button id=threset>Reset to site defaults</button></div></div>
-<div class=card><form id=f>
+<div class="card op"><form id=f>
 <input class=full name=source placeholder="Source URL (https://github.com/org/repo.git)" required>
 <label class=cap>Name (optional)<input name=name></label>
 <label class=cap>Sync interval (W, D, H, M; 0 = manual sync)<input name=interval value=3D placeholder="3D" title="e.g. 1W, 3D, 12H, 30M, 1D12H; 0 = manual only"></label>
@@ -2532,9 +2734,9 @@ PAGE = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport 
 <div class=row style="margin-bottom:12px"><input id=q type=search placeholder="Search name, URL, tags, description… (is:lfs = LFS not mirrored)" style="flex:1;min-width:180px" aria-label="Search mirrors">
 <select id=sortby style="width:auto;margin:0" aria-label="Sort by"><option value=name>Name</option><option value=added>Newest first</option><option value=oldest>Oldest first</option><option value=size>Largest first</option><option value=synced>Last synced</option><option value=status>Problems first</option></select>
 <span class=mut id=count></span></div>
-<div class="card row" id=bulk hidden style="position:sticky;top:8px;z-index:4"><b id=bulkn></b>
+<div class="card row op" id=bulk hidden style="position:sticky;top:8px;z-index:4"><b id=bulkn></b>
 <button data-b=sync>Sync</button><button data-b=pause>Pause</button><button data-b=resume>Resume</button><button data-b=hold_on>Hold on</button><button data-b=hold_off>Hold off</button>
-<button data-b=add_tag>+ Tag</button><button data-b=remove_tag>− Tag</button><button data-b=lfs_on title="Archive Git LFS files for the selected mirrors">LFS on</button><button data-b=optimize>Optimize</button><button data-b=delete>Delete</button>
+<button data-b=add_tag>+ Tag</button><button data-b=remove_tag>− Tag</button><button data-b=lfs_on title="Archive Git LFS files for the selected mirrors">LFS on</button><button data-b=optimize>Optimize</button><button class=adm data-b=delete>Delete</button>
 <span class=sp></span><span class=mut id=bulkmsg></span><button data-b=all>Select all shown</button><button data-b=none>Clear</button></div>
 <div id=list></div></main>
 <script>
@@ -2567,15 +2769,15 @@ function render(){let ms=cache.slice();
  shown=ms.map(m=>m.id);
  $('#count').textContent=ms.length==cache.length?cache.length+' mirrors':ms.length+' of '+cache.length+' mirrors';
  $('#list').innerHTML=ms.map(m=>{const st=m.running?'running':m.status,mt=m.meta||{};return `<div class=card data-id=${m.id}>
- <div class=row><input type=checkbox class=sel style="width:auto" aria-label="Select ${esc(m.name)}" ${selected.has(m.id)?'checked':''}><span class="dot ${st}"></span><b><a href="/repo/${m.id}">${esc(m.name)}</a></b>${mt.web_url?` <a class=mut href="${esc(mt.web_url)}" target=_blank rel="noopener noreferrer">origin ↗</a>`:''}${m.source_name?` <a class=mut href="/source/${m.source_id}">from ${esc(m.source_name)}</a>`:''}<span class=sp></span>
- <button data-a=sync ${m.running?'disabled':''}>Sync now</button><button data-a=toggle>${m.enabled?'Pause':'Resume'}</button><button data-a=hold title="Hold upstream rewrites and deletions for review instead of applying them">${m.hold?'Hold: on':'Hold: off'}</button>
- <button data-a=log>Log</button><button data-a=del>Delete</button><button data-a=edit>Edit</button></div>
+ <div class=row><input type=checkbox class="sel op" style="width:auto" aria-label="Select ${esc(m.name)}" ${selected.has(m.id)?'checked':''}><span class="dot ${st}"></span><b><a href="/repo/${m.id}">${esc(m.name)}</a></b>${mt.web_url?` <a class=mut href="${esc(mt.web_url)}" target=_blank rel="noopener noreferrer">origin ↗</a>`:''}${m.source_name?` <a class=mut href="/source/${m.source_id}">from ${esc(m.source_name)}</a>`:''}<span class=sp></span>
+ <button class=op data-a=sync ${m.running?'disabled':''}>Sync now</button><button class=op data-a=toggle>${m.enabled?'Pause':'Resume'}</button><button class=op data-a=hold title="Hold upstream rewrites and deletions for review instead of applying them">${m.hold?'Hold: on':'Hold: off'}</button>
+ <button data-a=log>Log</button><button class=adm data-a=del>Delete</button><button class=op data-a=edit>Edit</button></div>
  ${mt.description?`<div>${esc(mt.description)}</div>`:''}
  <div class=mut>${esc(m.source)}</div>
  ${(m.tags||[]).length?`<div class=row style="margin-top:4px">${m.tags.map(t=>`<span class=chip data-tag="${esc(t.toLowerCase())}">${esc(t)}</span>`).join('')}</div>`:''}
  <div class=mut>${m.enabled?(m.interval?'every '+m.interval_text:'manual'):'paused'} · last run ${ago(m.last_run)}${m.duration!=null?' ('+m.duration+'s)':''} · ${sz(m.size)}${m.next_run&&!m.running?' · next '+until(m.next_run):''}</div>
  ${m.held_count?`<div style="color:var(--run)">⏸ ${m.held_count} upstream change(s) on hold <a href="/repo/${m.id}">review</a></div>`:''}
- ${m.lfs_needed?`<div style="color:var(--run)">⚠ Uses Git LFS (${m.lfs_detect.files==1?'1 file':(m.lfs_detect.files??'some')+' files'}${m.lfs_detect.bytes?', '+sz(m.lfs_detect.bytes):''}) but the large files aren't being mirrored. ${m.lfs_detect.installed===false?'git-lfs is not installed on this server.':'<button data-a=lfs>Enable LFS</button>'}</div>`:''}
+ ${m.lfs_needed?`<div style="color:var(--run)">⚠ Uses Git LFS (${m.lfs_detect.files==1?'1 file':(m.lfs_detect.files??'some')+' files'}${m.lfs_detect.bytes?', '+sz(m.lfs_detect.bytes):''}) but the large files aren't being mirrored. ${m.lfs_detect.installed===false?'git-lfs is not installed on this server.':'<button class=op data-a=lfs>Enable LFS</button>'}</div>`:''}
  ${m.failures?`<div class=mut>failed ${m.failures}× in a row${m.retry_at?', retrying '+until(m.retry_at):''}</div>`:''}
  ${m.alert?`<div class=err>⚠ ${esc(m.alert)} <a href="/repo/${m.id}">details</a></div>`:''}
  ${m.error?`<div class=err>${esc(m.error)}</div>`:''}
@@ -2605,6 +2807,7 @@ $('#f').onsubmit=async e=>{e.preventDefault();const d=Object.fromEntries(new For
  const r=await api('/mirrors',{method:'POST',body:JSON.stringify(d)});
  if(r.ok){e.target.reset();$('#e').textContent='';load()}else{const j=await r.json();
   if(r.status==422&&j.account_url){$('#e').textContent=j.error;setTimeout(()=>location='/sources?add='+encodeURIComponent(j.account_url),1200)}else $('#e').textContent=j.error}};
+api('/auth/me').then(r=>r.json()).then(m=>{if(m.user)$('#logout').title='Signed in as '+m.user+' ('+m.role+')'});
 $('#logout').onclick=async e=>{e.preventDefault();await fetch('/api/auth/logout',{method:'POST',headers:{'Content-Type':'application/json'}});location='/login'};
 async function loadVer(){const v=await (await api('/version')).json(),el=$('#ver');
  if(!v.enabled){el.textContent='v'+v.version;return}
@@ -2656,6 +2859,12 @@ ADMIN = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport
 <label class=cap>Sync timeout (seconds)<input name=timeout type=number min=10 max=86400 required></label>
 <div class="full row"><span class="mut" id=ok></span><span class=sp></span><button class=p>Save</button></div>
 <div class="full err" id=e></div></form></div>
+<div class=card><b>Users</b> <span class=mut>viewer: read only. operator: add, sync and edit mirrors. admin: everything, including settings, deleting and users.</span>
+<div class=scroll><table id=utab></table></div>
+<form id=uf style="margin-top:10px"><label class=cap>New user name<input name=username autocomplete=off required pattern="[A-Za-z0-9_.@+\-]{1,64}"></label>
+<label class=cap>Starting password (8 or more characters)<input name=password type=password autocomplete=new-password minlength=8 required></label>
+<label class=cap>Role<select name=role><option value=viewer>viewer</option><option value=operator>operator</option><option value=admin>admin</option></select></label>
+<div class="full row"><span class=mut id=umsg></span><span class=sp></span><button class=p>Add user</button></div><div class="full err" id=uerr></div></form></div>
 <div class=card><b>Account</b> <span class=mut id=whoami></span>
 <form id=pf style="margin-top:8px">
 <label class=cap>Current password<input type=password name=current autocomplete=current-password required></label>
@@ -2663,6 +2872,8 @@ ADMIN = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport
 <label class=cap>Repeat the new password<input type=password name=again autocomplete=new-password minlength=8 required></label>
 <div class="full row"><span class=mut id=pmsg></span><span class=sp></span><button class=p>Change password</button></div><div class="full err" id=perr></div></form>
 <div class=mut>Changing the password signs out every other browser. Lost it? Stop gitmirror, delete <code>configs/auth.json</code> in the data folder and start it again to create a new account.</div></div>
+<div class=card><b>Recent activity</b> <span class=mut>changes made by signed-in users and by the script token</span>
+<div class=scroll><table id=atab></table></div></div>
 <div class=card><b>Backup and restore the mirror list</b>
 <div class=mut style="margin:2px 0 8px">Exports the list of mirrors and followed accounts (not the repository data). Credentials inside clone URLs are masked, so those entries can't be restored from the file.</div>
 <div class=row><a id=exp href="/api/export" download><button type=button>Download export</button></a><input type=file id=impf accept=".json,application/json" style="width:auto"><button id=imp>Import</button></div>
@@ -2672,7 +2883,27 @@ const api=(p,o={})=>fetch('/api'+p,{...o,headers:{'Content-Type':'application/js
 const f=document.querySelector('#f'),show=s=>{if(s.extras_default)document.querySelectorAll('[name=extras_default]').forEach(c=>c.checked=s.extras_default.includes(c.value));document.querySelector('#tokstate').textContent=s.github_token_set?'(set)':'(not set)';f.elements.github_token.value='';for(const k in s){const e=f.elements[k];if(k=='extras_default'||k=='github_token')continue;if(!e)continue;if(e.type=='checkbox')e.checked=!!s[k];else e.value=s[k+'_text']??s[k]}};
 
 api('/settings').then(r=>r.json()).then(show);
-api('/auth/me').then(r=>r.json()).then(m=>{if(m.user)document.querySelector('#whoami').textContent='signed in as '+m.user});
+let ME=null;
+api('/auth/me').then(r=>r.json()).then(m=>{ME=m;if(m.user)document.querySelector('#whoami').textContent='signed in as '+m.user+' ('+m.role+')';loadUsers()});
+const ago=t=>{const s=Date.now()/1e3-t;return s<90?Math.round(s)+'s ago':s<5400?Math.round(s/60)+'m ago':s<172800?Math.round(s/3600)+'h ago':Math.round(s/86400)+'d ago'};
+const esc2=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function loadUsers(){const us=await (await api('/users')).json();
+ document.querySelector('#utab').innerHTML='<tr><th>User</th><th>Role</th><th>Status</th><th></th></tr>'+us.map(u=>{const me=ME&&u.name.toLowerCase()==(ME.user||'').toLowerCase();
+  return `<tr data-k="${esc2(u.key)}"><td>${esc2(u.name)}${me?' <span class=mut>(you)</span>':''}</td>
+  <td><select data-f=role style="width:auto;margin:0">${['viewer','operator','admin'].map(r=>`<option ${r==u.role?'selected':''}>${r}</option>`).join('')}</select></td>
+  <td>${u.disabled?'<span class=err>disabled</span>':'active'}${u.signed_in?` <span class=mut>${u.signed_in} signed in</span>`:''}</td>
+  <td class=n>${me?'':`<button data-a=pw>Reset password</button> <button data-a=dis>${u.disabled?'Enable':'Disable'}</button> <button data-a=del>Delete</button>`}</td></tr>`}).join('');
+ const au=await (await api('/audit')).json();
+ document.querySelector('#atab').innerHTML='<tr><th>When</th><th>Who</th><th>What</th><th>On</th></tr>'+(au.slice(0,60).map(a=>`<tr><td class=n>${ago(a.t)}</td><td>${esc2(a.user)} <span class=mut>${esc2(a.role)}</span></td><td>${esc2(a.what)}${a.note?` <span class=mut>${esc2(a.note)}</span>`:''}</td><td>${esc2(a.target)}</td></tr>`).join('')||'<tr><td class=mut colspan=4>Nothing yet.</td></tr>')}
+document.querySelector('#utab').onchange=async e=>{const tr=e.target.closest('tr');if(!tr||e.target.dataset.f!='role')return;const r=await api('/users/'+encodeURIComponent(tr.dataset.k),{method:'PUT',body:JSON.stringify({role:e.target.value})});if(!r.ok)alert((await r.json()).error);loadUsers()};
+document.querySelector('#utab').onclick=async e=>{const b=e.target.closest('button'),tr=e.target.closest('tr');if(!b||!tr)return;const k=encodeURIComponent(tr.dataset.k),name=tr.firstElementChild.firstChild.textContent;let r;
+ if(b.dataset.a=='pw'){const pw=prompt('New password for '+name+' (8 or more characters). They will be signed out everywhere.');if(!pw)return;r=await api('/users/'+k,{method:'PUT',body:JSON.stringify({password:pw})})}
+ else if(b.dataset.a=='dis'){r=await api('/users/'+k,{method:'PUT',body:JSON.stringify({disabled:b.textContent=='Disable'})})}
+ else if(b.dataset.a=='del'){if(!confirm('Delete the user '+name+'?'))return;r=await api('/users/'+k,{method:'DELETE'})}
+ if(r&&!r.ok)alert((await r.json()).error);loadUsers()};
+document.querySelector('#uf').onsubmit=async ev=>{ev.preventDefault();const g=ev.target.elements,ue=document.querySelector('#uerr'),um=document.querySelector('#umsg');ue.textContent='';um.textContent='';
+ const r=await api('/users',{method:'POST',body:JSON.stringify({username:g.username.value,password:g.password.value,role:g.role.value})}),j=await r.json();
+ if(r.ok){um.textContent='User added';ev.target.reset();loadUsers()}else ue.textContent=j.error};
 api('/version').then(r=>r.json()).then(v=>{document.querySelector('#verline').textContent='This is v'+v.version+(v.enabled&&v.latest?(v.update_available?'; v'+v.latest+' is available.':'; that is the newest release.'):'')});
 document.querySelector('#pf').onsubmit=async ev=>{ev.preventDefault();const g=ev.target.elements,pe=document.querySelector('#perr'),pm=document.querySelector('#pmsg');pe.textContent='';pm.textContent='';
  if(g.new.value!==g.again.value){pe.textContent='The two new passwords differ.';return}
@@ -2693,19 +2924,19 @@ REPO = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport 
 <style>__STYLE__</style>
 <main><div class=row><h1 id=title>…</h1><span class=sp></span><a id=back href="/">All mirrors</a></div>
 <div class=card><div class=row><span id=dot class=dot></span><span id=state class=mut></span><span class=sp></span>
-<button data-a=sync>Sync now</button><button data-a=toggle id=tg>Pause</button><button data-a=hold id=hd title="Hold upstream rewrites and deletions for review instead of applying them">Hold: off</button><button data-a=meta>Refresh details</button><button data-a=verify title="git fsck: check the stored objects for corruption">Verify</button><button data-a=del>Delete</button></div>
+<button class=op data-a=sync>Sync now</button><button class=op data-a=toggle id=tg>Pause</button><button class=op data-a=hold id=hd title="Hold upstream rewrites and deletions for review instead of applying them">Hold: off</button><button class=op data-a=meta>Refresh details</button><button class=op data-a=verify title="git fsck: check the stored objects for corruption">Verify</button><button class=adm data-a=del>Delete</button></div>
 <div class=err id=err></div><div class=mut id=amsg></div></div>
 <div class=card id=heldcard style="display:none;border-color:var(--run)"><b>⏸ Upstream changes on hold</b>
 <div class=mut style="margin:4px 0">Your mirror still has the versions below. Nothing upstream has been applied to them.</div><pre id=heldlist></pre>
-<div class=row><button class=p id=accept>Accept changes</button><button id=reject>Keep mine</button><span class=mut>Accepting applies them and archives your old versions. Keep mine ignores these changes until upstream changes again.</span></div></div>
-<div class=card id=alertcard style="display:none;border-color:var(--err)"><div class=row><b class=err>⚠ Alert</b><span class=sp></span><button id=ack>Dismiss</button></div><div id=alerttxt style="margin-top:6px"></div></div>
+<div class="row op"><button class=p id=accept>Accept changes</button><button id=reject>Keep mine</button><span class=mut>Accepting applies them and archives your old versions. Keep mine ignores these changes until upstream changes again.</span></div></div>
+<div class=card id=alertcard style="display:none;border-color:var(--err)"><div class=row><b class=err>⚠ Alert</b><span class=sp></span><button class=op id=ack>Dismiss</button></div><div id=alerttxt style="margin-top:6px"></div></div>
 <div class=card><dl id=info></dl></div>
 <div class=card><b>Archive history</b> <span class=mut>(origin deletions, rewrites and outages; old versions are kept)</span><div id=evs style="margin-top:8px"></div></div>
 <div class=card><b>Also archive</b> <span class=mut>(more than the git history; refreshed on every sync)</span>
 <div class=row id=exbox style="margin:8px 0"></div><div id=exinfo></div></div>
 <div class=card><b>Tags</b><div class=row id=tags style="margin:8px 0"></div>
-<div class=row><input id=newtag placeholder="Add a tag" style="max-width:240px"><button id=addtag>Add</button><span class=mut id=tagmsg></span></div></div>
-<div class=card><form id=f>
+<div class="row op"><input id=newtag placeholder="Add a tag" style="max-width:240px"><button id=addtag>Add</button><span class=mut id=tagmsg></span></div></div>
+<div class="card op"><form id=f>
 <label class=cap>Name<input id=nm></label><label class=cap>Sync interval (W, D, H, M; 0 = manual sync)<input id=iv placeholder="3D"></label>
 <div class="full row"><span class=sp></span><span class=mut id=fmsg></span><button class=p>Save</button></div></form></div>
 <div class=card><b>Last sync log</b><pre id=log>…</pre></div></main>
@@ -2774,7 +3005,7 @@ async function loadExtras(){const sig=JSON.stringify(m.extras_state||{})+JSON.st
  const j=await (await api('/mirrors/'+id+'/extras')).json(),st=j.state||{},ex=m.extras||{};let h='';
  const line=(k,t)=>ex[k]?`<div class=${st[k]&&st[k].state=='error'?'err':'mut'}>${t}</div>`:'';
  const S=k=>st[k]||{};
- const ld=m.lfs_detect;if(ld&&ld.used)h+=`<div class="${m.lfs_needed?'err':'mut'}">Git LFS: this repo stores ${ld.files==1?'1 large file':(ld.files??'some')+' large files'}${ld.bytes?' ('+sz(ld.bytes)+')':''}${m.lfs_needed?(ld.installed===false?' and git-lfs is not installed on this server, so they are not being mirrored.':' and they are not being mirrored. <button id=lfson>Enable LFS</button>'):'.'}</div>`;
+ const ld=m.lfs_detect;if(ld&&ld.used)h+=`<div class="${m.lfs_needed?'err':'mut'}">Git LFS: this repo stores ${ld.files==1?'1 large file':(ld.files??'some')+' large files'}${ld.bytes?' ('+sz(ld.bytes)+')':''}${m.lfs_needed?(ld.installed===false?' and git-lfs is not installed on this server, so they are not being mirrored.':' and they are not being mirrored. <button class=op id=lfson>Enable LFS</button>'):'.'}</div>`;
  h+=line('wiki',S('wiki').state=='ok'?`Wiki: mirrored (${sz(S('wiki').size)}) at <code>${esc(m.local_path.replace(/\.git$/,'.wiki.git'))}</code>`:S('wiki').state=='none'?'Wiki: this repository has none':S('wiki').state=='error'?'Wiki: '+esc(S('wiki').msg):'Wiki: not fetched yet');
  h+=line('lfs',S('lfs').state=='ok'?`Git LFS: fetched (${sz(S('lfs').size)})`:S('lfs').state=='error'?'Git LFS: '+esc(S('lfs').msg):'Git LFS: not fetched yet');
  h+=line('releases',S('releases').state=='ok'?`Releases: ${S('releases').count} saved, ${S('releases').downloaded} new files downloaded${S('releases').skipped?', '+S('releases').skipped+' skipped (size limit or failed)':''}, ${sz(S('releases').bytes)} on disk`:S('releases').state=='error'?'Releases: '+esc(S('releases').msg):'Releases: not fetched yet');
@@ -2810,7 +3041,7 @@ MAINT = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport
 <style>__STYLE__</style>
 <main><div class=row><h1 id=title>Maintenance</h1><span class=sp></span><a id=back href="/">All mirrors</a></div>
 <div id=top></div>
-<div class=card id=optcard><div class=row><div><b>Optimize storage</b><div class=mut>Runs <code>git gc</code> on each mirror: repacks objects to save disk. Nothing is deleted, so archived history stays.</div></div><span class=sp></span><button id=verall title="git fsck on every mirror">Verify all</button><button class=p id=optall>Optimize all</button></div><div class=mut id=optmsg style="margin-top:6px"></div></div>
+<div class=card id=optcard><div class=row><div><b>Optimize storage</b><div class=mut>Runs <code>git gc</code> on each mirror: repacks objects to save disk. Nothing is deleted, so archived history stays.</div></div><span class=sp></span><button class=op id=verall title="git fsck on every mirror">Verify all</button><button class="p op" id=optall>Optimize all</button></div><div class=mut id=optmsg style="margin-top:6px"></div></div>
 <div class=card><b>Disk used over time</b><div id=chart class=mut style="margin-top:6px">Loading…</div></div>
 <div id=lists></div></main>
 <script>
@@ -2830,7 +3061,7 @@ const status=m=>m.origin_missing?'<span class=err>origin missing</span>':m.statu
 const table=rows=>rows.length?`<div class=scroll><table><tr><th>Name</th><th>Added</th><th>Last good sync</th><th>Size</th><th>Status</th><th>Tags</th><th></th></tr>${rows.map(m=>`<tr data-id=${m.id}>
  <td><a href="/repo/${m.id}">${esc(m.name)}</a>${m.lfs_needed&&m.lfs_detect?` <span class=mut>LFS: ${m.lfs_detect.files==1?'1 file':(m.lfs_detect.files??'?')+' files'}, ${bytes(m.lfs_detect.bytes)}</span>`:''}</td><td class=n>${day(m.added)}</td><td class=n>${ago(m.last_ok)}</td><td class=n>${bytes(m.size)}</td><td>${status(m)}</td>
  <td>${(m.tags||[]).map(t=>`<span class=chip style="cursor:default">${esc(t)}</span>`).join(' ')}</td>
- <td class=n>${m.lfs_needed?'<button data-a=lfs>Enable LFS</button> ':''}<button data-a=opt>Optimize</button> <button data-a=del>Delete</button></td></tr>`).join('')}</table></div>`:'<p class=mut>Nothing here.</p>';
+ <td class=n>${m.lfs_needed?'<button class=op data-a=lfs>Enable LFS</button> ':''}<button class=op data-a=opt>Optimize</button> <button class=adm data-a=del>Delete</button></td></tr>`).join('')}</table></div>`:'<p class=mut>Nothing here.</p>';
 async function loadLists(){const ks=only?[only]:Object.keys(kinds);
  const res=await Promise.all(ks.map(k=>api('/maintenance?kind='+k+(only?'':'&limit=10')).then(r=>r.json())));
  $('#lists').innerHTML=ks.map((k,i)=>(!only&&k=='lfs'&&!res[i].total)?'':`<div class=card><div class=row><b>${esc(kinds[k][0])}</b>${only?` <span class=mut>(${res[i].total})</span>`:''}<span class=sp></span>${!only&&res[i].total>10?`<a href="/maintenance/${k}">View full list (${res[i].total}) →</a>`:''}</div>
@@ -2881,7 +3112,7 @@ let preview=null;
 /* ---------- list page ---------- */
 async function list(){
  const ss=await (await api('/sources')).json();
- $('#view').innerHTML=`<div class=card><b>Follow a user, org or group</b>
+ $('#view').innerHTML=`<div class="card op"><b>Follow a user, org or group</b>
   <div class=mut style="margin:2px 0 8px">Paste an account page, e.g. https://github.com/name. You'll choose which repositories to mirror before anything is added.</div>
   <form id=pf class=row style="flex-wrap:nowrap"><input id=purl placeholder="https://github.com/name" required><button class=p>Preview</button></form><div class=err id=perr></div></div>
   <div id=prev></div>
@@ -2930,15 +3161,15 @@ async function detail(){
  const pend=rows('pending'),gone=rows('gone'),skip=rows('excluded');
  $('#view').innerHTML=`
  <div class=card><div class=row><span class=mut>${esc(x.kind)} ${esc(x.account_type)} · ${esc(x.hostport)} · scanned ${ago(x.last_scan)} · rescans every ${esc(x.rescan_text)}</span><span class=sp></span>
-  <a href="/?tag=${encodeURIComponent(x.name.toLowerCase())}">view mirrors on main page</a><button id=rescan>Rescan now</button><button id=del>Remove source</button></div>
-  ${x.last_error?`<div class=err>${esc(x.last_error)}</div>`:''}${x.alert?`<div class=row><span class=err>⚠ ${esc(x.alert)}</span><button id=ack>Dismiss</button></div>`:''}</div>
- ${pend.length?`<div class=card style="border-color:var(--run)"><div class=row><b>⏸ ${pend.length} new repositor${pend.length==1?'y':'ies'} waiting for approval</b><span class=sp></span><button class=p id=appall>Mirror all</button></div>
-  <div class=scroll><table>${pend.map(([p,k])=>`<tr data-p="${esc(p)}"><td><b>${esc(k.name)}</b>${k.arch?' <span class=chip style="cursor:default">archived</span>':''}<div class=mut>${esc(k.desc||'')}</div></td><td class=n>${kb(k.size_kb)}</td><td class=n><button data-a=approve>Mirror</button> <button data-a=skip>Skip</button></td></tr>`).join('')}</table></div></div>`:''}
+  <a href="/?tag=${encodeURIComponent(x.name.toLowerCase())}">view mirrors on main page</a><button class=op id=rescan>Rescan now</button><button class=adm id=del>Remove source</button></div>
+  ${x.last_error?`<div class=err>${esc(x.last_error)}</div>`:''}${x.alert?`<div class=row><span class=err>⚠ ${esc(x.alert)}</span><button class=op id=ack>Dismiss</button></div>`:''}</div>
+ ${pend.length?`<div class=card style="border-color:var(--run)"><div class=row><b>⏸ ${pend.length} new repositor${pend.length==1?'y':'ies'} waiting for approval</b><span class=sp></span><button class="p op" id=appall>Mirror all</button></div>
+  <div class=scroll><table>${pend.map(([p,k])=>`<tr data-p="${esc(p)}"><td><b>${esc(k.name)}</b>${k.arch?' <span class=chip style="cursor:default">archived</span>':''}<div class=mut>${esc(k.desc||'')}</div></td><td class=n>${kb(k.size_kb)}</td><td class=n><button class=op data-a=approve>Mirror</button> <button class=op data-a=skip>Skip</button></td></tr>`).join('')}</table></div></div>`:''}
  ${gone.length?`<div class=card style="border-color:var(--err)"><b class=err>${gone.length} no longer in the account</b><div class=mut>Still mirrored and kept as archives.</div>
   <div class=scroll><table>${gone.map(([p,k])=>`<tr><td><a href="/repo/${k.mirror}">${esc(k.name)}</a></td><td class=mut>${esc(p)}</td></tr>`).join('')}</table></div></div>`:''}
  <div class=card><b>Mirrored (${mine.length})</b><div class=scroll><table><tr><th>Name</th><th>Status</th><th>Last good sync</th><th>Size</th><th>Tags</th></tr>
   ${mine.map(m=>`<tr><td><a href="/repo/${m.id}">${esc(m.name)}</a></td><td>${m.status=='error'?'<span class=err>error</span>':esc(m.status)}${m.gone_from_source?' <span class=err>gone</span>':''}</td><td class=n>${ago(m.last_ok)}</td><td class=n>${m.size!=null?kb(Math.round(m.size/1024)):'—'}</td><td>${(m.tags||[]).map(t=>`<span class=chip style="cursor:default">${esc(t)}</span>`).join(' ')}</td></tr>`).join('')||'<tr><td class=mut>Nothing mirrored yet.</td></tr>'}</table></div></div>
- <div class=card><b>Settings for this source</b><form id=sf style="margin-top:8px">
+ <div class="card op"><b>Settings for this source</b><form id=sf style="margin-top:8px">
   <label class=cap>Interval for new repositories<input name=interval value="${esc(x.interval_text)}"></label>
   <label class=cap>Rescan the account every (0 = manual)<input name=rescan value="${esc(x.rescan_text)}"></label>
   <label class="cap full">Extra tags for new repositories<input name=tags value="${esc((x.tags||[]).join(', '))}"></label>
@@ -3049,7 +3280,7 @@ def main():
                  f"It is running as uid {os.getuid() if hasattr(os, 'getuid') else '?'}. The directory must exist and that user needs read and write access\n"
                  f"(on TrueNAS: make the dataset owned by the app user, uid 568; in Docker: chown the folder to 1000).")
     threading.Thread(target=scheduler, args=(Handler.store,), daemon=True).start()
-    if not Handler.store.auth:
+    if not Handler.store.users:
         where = f"http://{'localhost' if a.host in ('0.0.0.0', '::') else a.host}:{a.port}/setup"
         print(f"No account yet: open {where} to create the admin account." + (" You will need the GITMIRROR_TOKEN value as the setup code." if API_TOKEN else ""), flush=True)
         if a.host not in ("127.0.0.1", "localhost", "::1") and not API_TOKEN:

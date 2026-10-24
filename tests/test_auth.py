@@ -21,7 +21,7 @@ gm = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gm)
 # the page templates get their stylesheet inserted when the program starts; do the same here
 for _name in ("PAGE", "ADMIN", "REPO", "MAINT", "SOURCES", "EVENTS", "LOGIN", "SETUP"):
-    setattr(gm, _name, getattr(gm, _name).replace("<style>__STYLE__</style>", "<style>" + gm.STYLE + "</style>"))
+    setattr(gm, _name, getattr(gm, _name).replace("<style>__STYLE__</style>", gm.THEME_JS + "<style>" + gm.STYLE + "</style>"))
 
 
 class PasswordTests(unittest.TestCase):
@@ -88,7 +88,11 @@ class Base(unittest.TestCase):
         self.old = (gm.API_TOKEN, gm.Handler.store)
         gm.API_TOKEN = "setup-code"
         gm.LOGIN_FAILS.clear()
+        self.prepare()
         self.start()
+
+    def prepare(self):
+        """Hook: put files in the data folder before the server starts."""
 
     def start(self):
         self.store = gm.Store(self.tmp)
@@ -131,8 +135,8 @@ class Base(unittest.TestCase):
                 return v.split(";")[0].split("=", 1)[1]
         return None
 
-    def make_account(self, user="ed", pw="correct horse"):
-        self.store.auth = {"user": user, "hash": gm.hash_password(pw), "created": time.time()}
+    def make_account(self, user="ed", pw="correct horse", role="admin"):
+        self.store.users[user.casefold()] = {"name": user, "hash": gm.hash_password(pw), "role": role, "created": time.time()}
         self.store.save_auth()
 
     def login(self, user="ed", pw="correct horse"):
@@ -156,7 +160,7 @@ class SetupTests(Base):
         self.assertEqual(self.req("POST", "/api/auth/setup", dict(ok, setup_code="nope"))[0], 403)
         self.assertEqual(self.req("POST", "/api/auth/setup", dict(ok, password="short"))[0], 400)
         self.assertEqual(self.req("POST", "/api/auth/setup", dict(ok, username="a b"))[0], 400)
-        self.assertEqual(self.store.auth, {})
+        self.assertEqual(self.store.users, {})
 
     def test_setup_creates_account_and_signs_in(self):
         status, resp, _ = self.req("POST", "/api/auth/setup", {"username": "ed", "password": "correct horse", "setup_code": "setup-code"})
@@ -170,6 +174,7 @@ class SetupTests(Base):
         # the password is only ever stored hashed, and both files are private to the owner
         with open(self.store.auth_path) as f:
             self.assertNotIn("correct horse", f.read())
+        self.assertEqual(self.store.users["ed"]["role"], "admin")  # the first user is always an admin
         if os.name == "posix":
             for f in (self.store.auth_path, self.store.sessions_path):
                 self.assertEqual(os.stat(f).st_mode & 0o077, 0)
