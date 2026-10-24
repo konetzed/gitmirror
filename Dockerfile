@@ -11,6 +11,8 @@ RUN apt-get update \
  && git lfs install --system \
  && git config --system safe.directory '*'
 
+# the app is stdlib-only and never runs pip; removing it (and its bundled urllib3/msgpack) and setuptools keeps their CVEs out of the image
+RUN pip uninstall -y pip setuptools wheel 2>/dev/null; rm -rf /usr/local/lib/python3.13/site-packages/pip* /usr/local/lib/python3.13/site-packages/setuptools* /usr/local/lib/python3.13/site-packages/wheel* /usr/local/bin/pip*
 RUN useradd --create-home --uid 1000 gitmirror && mkdir /data && chown gitmirror:gitmirror /data
 # TrueNAS SCALE runs apps as uid 568 ("apps"). ssh refuses to start for a uid without a passwd entry, so give it one.
 RUN useradd --uid 568 --no-create-home --home-dir /home/gitmirror --shell /usr/sbin/nologin apps

@@ -2146,14 +2146,14 @@ def version_out(store):
 
 def parse_networks(text):
     nets = []
-    for part in (text or "").split(","):
+    for pos, part in enumerate((text or "").split(","), 1):
         part = part.strip()
         if not part:
             continue
         try:
             nets.append(ipaddress.ip_network(part, strict=False))
         except ValueError:
-            print(f"WARNING: ignoring {part!r} in GITMIRROR_TRUSTED_PROXIES (not an address or network)", file=sys.stderr, flush=True)
+            print(f"WARNING: ignoring entry {pos} of GITMIRROR_TRUSTED_PROXIES (not an address or network)", file=sys.stderr, flush=True)
     return nets
 
 
@@ -3665,7 +3665,7 @@ def main():
                  f"(on TrueNAS: make the dataset owned by the app user, uid 568; in Docker: chown the folder to 1000).")
     threading.Thread(target=scheduler, args=(Handler.store,), daemon=True).start()
     if TRUSTED_PROXIES:
-        print("Trusting X-Forwarded-For from: " + ", ".join(str(n) for n in TRUSTED_PROXIES), flush=True)
+        print(f"Trusting X-Forwarded-For from {len(TRUSTED_PROXIES)} configured proxy network(s)", flush=True)
     if not Handler.store.users:
         where = f"http://{'localhost' if a.host in ('0.0.0.0', '::') else a.host}:{a.port}/setup"
         print(f"No account yet: open {where} to create the admin account." + (" You will need the GITMIRROR_TOKEN value as the setup code." if API_TOKEN else ""), flush=True)

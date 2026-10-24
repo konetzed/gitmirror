@@ -22,6 +22,8 @@ All notable changes to gitmirror are listed here, newest first. Versions follow 
 - Release-asset links from a forge are kept only when they are `http(s)` URLs, like every other link from an API.
 - Every `git` subprocess runs with no stdin, which removes a class of environment-dependent clone failures.
 - Clone URLs containing whitespace are rejected.
+- The container image no longer ships pip, setuptools or wheel (gitmirror never uses them), which clears the urllib3, msgpack and setuptools CVEs Trivy reported from their bundled copies.
+- Startup messages no longer echo the `GITMIRROR_TRUSTED_PROXIES` values (CodeQL flagged them as clear-text logging); a bad entry is reported by position.
 - Doc fixes: the `docker run` example pins `0.0.3-beta` instead of `latest` (which still points at an old build until the first stable release); `/healthz` is noted as revealing the version. The 0.0.3-beta note "every file gitmirror writes mode 600" applies to the JSON files in `configs/`; per-mirror logs and the extras folder rely on the 700 data folder.
 
 ## [0.0.3-beta] - 2026-10-24
