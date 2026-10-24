@@ -5,3 +5,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+  # keeps the pinned GitHub Actions in .github/workflows current
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

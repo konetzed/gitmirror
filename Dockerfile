@@ -12,6 +12,8 @@ RUN apt-get update \
  && git config --system safe.directory '*'
 
 RUN useradd --create-home --uid 1000 gitmirror && mkdir /data && chown gitmirror:gitmirror /data
+# TrueNAS SCALE runs apps as uid 568 ("apps"). ssh refuses to start for a uid without a passwd entry, so give it one.
+RUN useradd --uid 568 --no-create-home --home-dir /home/gitmirror --shell /usr/sbin/nologin apps
 COPY gitmirror.py LICENSE /app/
 
 ENV GITMIRROR_DATA=/data \

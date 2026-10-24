@@ -6,3 +6,6 @@ __pycache__/
 .git/
 README.md
 docker-compose.yml
+docs/
+deploy/
+.github/

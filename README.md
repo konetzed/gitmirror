@@ -50,6 +50,20 @@ Open <http://127.0.0.1:8080/?token=YOUR_TOKEN> (the token is remembered in the l
 
 The compose file publishes the port on `127.0.0.1` only. To reach it from other machines, front it with a reverse proxy that terminates HTTPS, and keep the token set.
 
+### Use the published image instead of building it
+
+Every push to `main` is built for amd64 and arm64 and published to GitHub's container registry:
+
+```bash
+export GITMIRROR_TOKEN="$(openssl rand -hex 24)"   # note it down; you need it to open the UI
+mkdir -p data && sudo chown 1000:1000 data
+docker run -d --name gitmirror --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 -e GITMIRROR_TOKEN -v "$PWD/data:/data" \
+  ghcr.io/konetzed/gitmirror:latest
+```
+
+Tags: `latest` (newest commit on `main`), `sha-<commit>`, and `1.2.3` / `1.2` for each release tag `v1.2.3`. Pin a version tag if you want updates to happen only when you choose.
+
 ### Updating
 
 ```bash
@@ -65,6 +79,18 @@ extras/    <id>/issues.json, releases.json and downloaded release files
 ```
 
 Back up the whole `data` directory (or just `configs/` plus `repos/`). **Admin > Backup and restore** also exports the list of mirrors and followed accounts as JSON.
+
+## Run on TrueNAS SCALE (24.10 or newer)
+
+SCALE 24.10 and later run apps on Docker, so the published image works as a custom app.
+
+1. **Make a dataset** for gitmirror's data, for example `tank/apps/gitmirror`. Give the `apps` user (uid 568) ownership with read and write access (**Storage**, then the dataset's **Permissions**; the "Apps" ACL preset does this if your version offers it).
+2. **Install the app:** **Apps**, **Discover Apps**, the three-dot menu at the top right, **Install via YAML**. Name it `gitmirror`, paste [`deploy/truenas-scale.yaml`](deploy/truenas-scale.yaml), and change the two lines marked `CHANGE`: the token and the dataset path. The wording of the menu varies slightly between releases. If you prefer the form instead, use image `ghcr.io/konetzed/gitmirror`, port `8080`, user and group `568`, the `GITMIRROR_TOKEN` variable, and a host-path volume from your dataset to `/data`.
+3. **Open it** at `http://<your-nas>:8080/?token=<your token>`. The app card shows a health status from the image's built-in check.
+4. **Update it** by changing the image tag in the app's YAML (for example `:1.0.0` to `:1.1.0`) and saving. Pinning a version tag is more reliable than `latest`, because TrueNAS does not re-pull an unchanged tag.
+5. **Back it up** by snapshotting and replicating the dataset: it holds every mirror and all settings.
+
+Keep it on your LAN and keep the token set. To reach it from outside, put an HTTPS reverse proxy with its own login in front. Private repositories over SSH work too: put the key in the dataset (`ssh/id_ed25519`, mode 600, owned by the app user) and enable the `GIT_SSH_COMMAND` line in the YAML.
 
 ## Running without Docker
 
