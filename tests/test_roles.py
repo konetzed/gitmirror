@@ -17,7 +17,8 @@ class RuleTests(unittest.TestCase):
             ("GET", "/api/history", "viewer"), ("GET", "/api/events", "viewer"), ("GET", "/api/maintenance", "viewer"),
             ("GET", "/api/sources", "viewer"), ("GET", "/api/sources/abc123", "viewer"), ("GET", "/api/settings", "viewer"),
             ("GET", "/api/version", "viewer"), ("GET", "/api/auth/me", "viewer"), ("GET", "/dl/abc123/releases/v1/tool.bin", "viewer"),
-            ("GET", "/admin", "admin"), ("GET", "/api/export", "admin"), ("GET", "/api/users", "admin"), ("GET", "/api/audit", "admin"),
+            ("GET", "/admin", "admin"), ("GET", "/api/export", "admin"), ("GET", "/api/users", "admin"), ("GET", "/api/audit", "admin"), ("GET", "/account", "viewer"), ("GET", "/api/keys", "viewer"),
+            ("POST", "/api/keys", "viewer"), ("DELETE", "/api/keys/abc123", "viewer"),
             ("POST", "/api/auth/logout", "viewer"), ("POST", "/api/auth/password", "viewer"),
             ("POST", "/api/mirrors", "operator"), ("POST", "/api/mirrors/abc123/sync", "operator"), ("POST", "/api/mirrors/abc123/hold", "operator"),
             ("POST", "/api/mirrors/abc123/accept", "operator"), ("POST", "/api/mirrors/abc123/lfs", "operator"),
@@ -141,7 +142,7 @@ class UserManagementTests(RoleServerBase):
         self.assertEqual(self.api("POST", "/api/users", {"username": "Zoe", "password": "zoe-password", "role": "operator"})[0], 201)
         self.assertEqual(self.api("POST", "/api/users", {"username": "ZOE", "password": "zoe-password", "role": "viewer"})[0], 409)  # names ignore case
         tok = self.login("zoe", "zoe-password")
-        self.assertEqual(self.req("GET", "/api/auth/me", cookie=tok)[2], {"user": "Zoe", "role": "operator", "via": "session"})
+        self.assertEqual(self.req("GET", "/api/auth/me", cookie=tok)[2], {"user": "Zoe", "role": "operator", "via": "session", "key_name": None})
         self.assertNotIn("hash", json.dumps(self.api("GET", "/api/users")[2]))  # password hashes never leave the server
 
     def test_a_role_change_applies_to_the_next_request_without_signing_in_again(self):

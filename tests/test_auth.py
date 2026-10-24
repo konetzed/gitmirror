@@ -20,7 +20,7 @@ spec = importlib.util.spec_from_file_location("gitmirror", ROOT / "gitmirror.py"
 gm = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gm)
 # the page templates get their stylesheet inserted when the program starts; do the same here
-for _name in ("PAGE", "ADMIN", "REPO", "MAINT", "SOURCES", "EVENTS", "LOGIN", "SETUP"):
+for _name in ("PAGE", "ADMIN", "REPO", "MAINT", "SOURCES", "EVENTS", "LOGIN", "SETUP", "ACCOUNT"):
     setattr(gm, _name, getattr(gm, _name).replace("<style>__STYLE__</style>", gm.THEME_JS + "<style>" + gm.STYLE + "</style>"))
 
 

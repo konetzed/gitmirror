@@ -32,6 +32,10 @@ __version__ = "0.0.2-beta"
 REPO_URL = "https://github.com/konetzed/gitmirror"
 API_TOKEN = os.environ.get("GITMIRROR_TOKEN", "")  # optional: setup code for the first account, and a Bearer token for scripts
 ROLES = ("viewer", "operator", "admin")  # lowest to highest
+KEY_PREFIX = "gm_"               # personal API keys look like gm_<43 random characters>
+KEY_ROLES = ("viewer", "operator")  # a key is never an admin, whoever owns it
+MAX_KEYS_PER_USER = 20
+KEY_TOUCH_SECS = 60              # "last used" is written at most this often per key
 TOKEN_ROLE = os.environ.get("GITMIRROR_TOKEN_ROLE", "operator").strip().lower()
 if TOKEN_ROLE not in ("viewer", "operator"):  # the script token is never an admin
     TOKEN_ROLE = "operator"
@@ -1775,15 +1779,15 @@ def role_rank(role):
 def required_role(method, path, body=None):
     """The lowest role allowed to make this request. Anything not listed here needs an admin (deny by default)."""
     if method == "GET":
-        if re.fullmatch(r"/|/events|/maintenance(/\w+)?|/sources|/source/\w+|/repo/\w+", path):
+        if re.fullmatch(r"/|/events|/account|/maintenance(/\w+)?|/sources|/source/\w+|/repo/\w+", path):
             return "viewer"
-        if re.fullmatch(r"/api/(mirrors|stats|summary|history|events|maintenance|sources|settings|version|auth/me)|"
+        if re.fullmatch(r"/api/(mirrors|stats|summary|history|events|maintenance|sources|settings|version|keys|auth/me)|"
                         r"/api/mirrors/\w+(/(log|extras))?|/api/sources/\w+|/dl/\w+/releases/[^/]+/[^/]+", path):
             return "viewer"
         return "admin"  # /admin, /api/export, /api/users, /api/audit and anything unknown
     if method == "POST":
-        if path in ("/api/auth/logout", "/api/auth/password"):
-            return "viewer"  # acts on your own session and password
+        if path in ("/api/auth/logout", "/api/auth/password", "/api/keys"):
+            return "viewer"  # acts on your own session, password and keys
         if path == "/api/bulk":
             return "admin" if (body or {}).get("action") == "delete" else "operator"
         if re.fullmatch(r"/api/(mirrors|sources|sources/preview|maintenance/(verify|optimize)|version/check)|"
@@ -1795,6 +1799,8 @@ def required_role(method, path, body=None):
         if re.fullmatch(r"/api/(mirrors|sources)/\w+", path):
             return "operator"
         return "admin"  # /api/settings, /api/users/<name>
+    if method == "DELETE" and re.fullmatch(r"/api/keys/\w+", path):
+        return "viewer"  # revoke one of your own keys
     return "admin"  # DELETE and anything else: removing mirrors, sources or users
 
 
@@ -1825,13 +1831,16 @@ def audit_note(path, body):
         return f"{body.get('action')} on {len(body.get('ids') or [])} mirrors"
     if path == "/api/settings":
         return "changed: " + ", ".join(sorted(k for k in body if k not in ("github_token",)))[:200] + (", github_token" if "github_token" in body else "")
+    if path == "/api/keys":
+        return f"new key '{str(body.get('name', ''))[:40]}' ({body.get('role')})"
     if path.startswith("/api/users"):
-        return ", ".join(f"{k}={body[k]}" for k in ("role", "disabled") if k in body) + (" password reset" if "password" in body else "")
+        return ", ".join(f"{k}={body[k]}" for k in ("role", "disabled") if k in body) + (" password reset" if "password" in body else "") + (" keys revoked" if body.get("revoke_keys") else "")
     return ""
 
 
 def audit_add(store, ident, method, path, target, note):
     entry = {"t": time.time(), "user": ident.get("name") or "script token", "role": ident["role"],
+             "via": f"key '{ident['key_name']}'" if ident.get("key_name") else "",
              "what": f"{method} " + re.sub(r"/[0-9a-f]{10}\b", "/:id", path), "target": target, "note": note}
     with store.lock:
         store.audit.append(entry)
@@ -1840,6 +1849,35 @@ def audit_add(store, ident, method, path, target, note):
             store.save_audit()
         except OSError:
             pass
+
+
+def key_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()  # the key is 256 random bits, so a fast hash is enough
+
+
+def find_key(store, token):
+    h = key_hash(token)
+    for ukey, u in store.users.items():
+        for k in u.get("keys", []):
+            if hmac.compare_digest(k["hash"], h):
+                return ukey, u, k
+    return None
+
+
+def create_key(store, ukey, name, role, days):
+    """-> (token shown once, public record). Only the hash is stored."""
+    tok = KEY_PREFIX + secrets.token_urlsafe(32)
+    now = time.time()
+    rec = {"id": secrets.token_hex(4), "name": name, "hash": key_hash(tok), "prefix": tok[:7], "role": role,
+           "created": now, "last_used": None, "last_ip": None, "expires": now + days * 86400 if days else None}
+    with store.lock:
+        store.users[ukey].setdefault("keys", []).append(rec)
+        store.save_auth()
+    return tok, key_public(rec)
+
+
+def key_public(k):
+    return {f: k.get(f) for f in ("id", "name", "prefix", "role", "created", "last_used", "last_ip", "expires")}
 
 
 def end_user_sessions(store, key):
@@ -1988,6 +2026,21 @@ class Handler(BaseHTTPRequestHandler):
         ah = self.headers.get("Authorization") or ""
         if API_TOKEN and ah.startswith("Bearer ") and hmac.compare_digest(ah[7:].encode(), API_TOKEN.encode()):
             return {"via": "token", "name": None, "key": None, "role": TOKEN_ROLE}
+        if ah.startswith("Bearer " + KEY_PREFIX):
+            hit = find_key(self.store, ah[7:])
+            now = time.time()
+            if not hit:
+                return None
+            ukey, u, k = hit
+            if u.get("disabled") or (k.get("expires") and k["expires"] <= now):
+                return None
+            ip = self.client_address[0]
+            if not k.get("last_used") or now - k["last_used"] > KEY_TOUCH_SECS or k.get("last_ip") != ip:
+                with self.store.lock:
+                    k["last_used"], k["last_ip"] = now, ip
+                    self.store.save_auth()
+            role = min(u["role"], k["role"], key=role_rank)  # never more than the owner has right now, nor more than the key was given
+            return {"via": "key", "name": u["name"], "key": ukey, "role": role, "key_id": k["id"], "key_name": k["name"]}
         tok = self.cookie("gm_session")
         key = session_user(self.store, tok) if tok else None
         u = self.store.users.get(str(key).casefold()) if key else None  # the role is read fresh every time, so a change applies at once
@@ -2005,7 +2058,8 @@ class Handler(BaseHTTPRequestHandler):
             if "application/json" not in self.headers.get("Content-Type", "") and (self.headers.get("Content-Length") or "0") != "0":
                 return self.send(415, {"error": "json only"})
             org = self.headers.get("Origin")
-            if org and urlparse(org).netloc != self.headers.get("Host"):
+            header_only = (self.headers.get("Authorization") or "").startswith("Bearer ") and not self.cookie("gm_session")
+            if org and urlparse(org).netloc != self.headers.get("Host") and not header_only:  # a key or token header can't be forged cross-site
                 return self.send(403, {"error": "bad origin"})
         body = {}
         try:
@@ -2070,8 +2124,15 @@ class Handler(BaseHTTPRequestHandler):
             LOGIN_FAILS.pop(ip, None)
             return self.send(200, {"ok": True}, headers=self.session_header(new_session(st, name.casefold(), self.headers.get("User-Agent", ""))))
 
+        bearer = (self.headers.get("Authorization") or "").startswith("Bearer ")
+        if bearer:
+            wait = login_wait(ip)
+            if wait:
+                return self.send(429, {"error": f"Too many failed attempts. Try again in {wait} seconds."}, headers={"Retry-After": str(wait)})
         ident = self.identity()
         if not ident:
+            if bearer:
+                login_failed(ip)
             if method == "GET" and not path.startswith(("/api/", "/dl/")):
                 return self.redirect("/setup" if not st.users else "/login")
             return self.send(401, {"error": "unauthorized", "setup_required": not st.users})
@@ -2092,7 +2153,7 @@ class Handler(BaseHTTPRequestHandler):
                     st.save_sessions()
             return self.send(200, {"ok": True}, headers=self.session_header(None))
         if method == "GET" and path == "/api/auth/me":
-            return self.send(200, {"user": ident["name"], "role": ident["role"], "via": ident["via"]})
+            return self.send(200, {"user": ident["name"], "role": ident["role"], "via": ident["via"], "key_name": ident.get("key_name")})
         if method == "POST" and path == "/api/auth/password":
             if ident["via"] != "session":
                 return self.send(403, {"error": "Change the password from a signed-in browser."})
@@ -2115,6 +2176,43 @@ class Handler(BaseHTTPRequestHandler):
             end_user_sessions(st, ident["key"])  # that user's other browsers have to sign in again
             return self.send(200, {"ok": True}, headers=self.session_header(new_session(st, ident["key"], self.headers.get("User-Agent", ""))))
 
+        # ---- your own API keys (a signed-in browser only: a key or token can't create or revoke keys)
+        if method == "GET" and path == "/account":
+            return self.send(200, ACCOUNT, "text/html")
+        mk = re.match(r"^/api/keys(?:/(\w+))?$", path)
+        if mk:
+            if ident["via"] != "session":
+                return self.send(403, {"error": "Manage API keys from a signed-in browser."})
+            me = st.users[ident["key"]]
+            if method == "GET" and not mk.group(1):
+                return self.send(200, [key_public(k) for k in me.get("keys", [])])
+            if method == "POST" and not mk.group(1):
+                name, role = body.get("name"), body.get("role", "viewer")
+                try:
+                    days = int(body.get("expires_days") or 0)
+                    if not isinstance(name, str) or not 1 <= len(name.strip()) <= 40:
+                        raise ValueError("Give the key a name of 1 to 40 characters")
+                    if role not in KEY_ROLES:
+                        raise ValueError("A key is read-only (viewer) or operator")
+                    if role_rank(role) > role_rank(me["role"]):
+                        raise ValueError(f"You are a {me['role']}, so a key can't be more than that")
+                    if days not in (0, 30, 90, 365):
+                        raise ValueError("Choose never, 30, 90 or 365 days")
+                    if len(me.get("keys", [])) >= MAX_KEYS_PER_USER:
+                        raise ValueError(f"At most {MAX_KEYS_PER_USER} keys per user: revoke one you no longer use")
+                except (ValueError, TypeError) as e:
+                    return self.send(400, {"error": str(e)})
+                tok, rec = create_key(st, ident["key"], name.strip(), role, days)
+                return self.send(201, dict(rec, key=tok))  # the only time the key itself is ever shown
+            if method == "DELETE" and mk.group(1):
+                with st.lock:
+                    keys = me.get("keys", [])
+                    if not any(k["id"] == mk.group(1) for k in keys):
+                        return self.send(404, {"error": "no such key"})
+                    me["keys"] = [k for k in keys if k["id"] != mk.group(1)]
+                    st.save_auth()
+                return self.send(200, {"ok": True})
+
         # ---- users and the activity log (admins only; required_role denies everything else by default)
         mu = re.match(r"^/api/users(?:/([^/]+))?$", path)
         if mu:
@@ -2123,7 +2221,8 @@ class Handler(BaseHTTPRequestHandler):
                 with st.lock:
                     now = time.time()
                     return self.send(200, [{"name": u["name"], "key": k, "role": u["role"], "disabled": bool(u.get("disabled")), "created": u.get("created"),
-                                            "signed_in": sum(1 for x in st.sessions.values() if str(x.get("user", "")).casefold() == k and x["exp"] > now)}
+                                            "signed_in": sum(1 for x in st.sessions.values() if str(x.get("user", "")).casefold() == k and x["exp"] > now),
+                                            "keys": len(u.get("keys", []))}
                                            for k, u in sorted(st.users.items())])
             if key is None and method == "POST":
                 try:
@@ -2164,6 +2263,8 @@ class Handler(BaseHTTPRequestHandler):
                     if not active_admins(after):
                         return self.send(409, {"error": "Keep at least one active admin"})
                     u.update(new)
+                    if body.get("revoke_keys"):
+                        u["keys"] = []
                     if digest:
                         u["hash"] = digest
                     st.save_auth()
@@ -2719,7 +2820,7 @@ PAGE = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport 
 <style>__STYLE__</style>
 <main><div class=row style="position:relative"><h1><a class=brand href="https://github.com/konetzed/gitmirror" target=_blank rel="noopener noreferrer" title="gitmirror on GitHub">Git Mirror</a></h1><span class=mut id=ver></span><span class=sp></span><a data-nav href="/events">Events</a><a data-nav href="/sources">Sources</a><a data-nav href="/maintenance">Maintenance</a><a class=adm data-nav href="/admin">Admin</a>
 <button class=icon id=thbtn title="Theme options" aria-haspopup=true aria-expanded=false>🎨</button>
-<label class=tgl title="Light / dark"><input type=checkbox id=themetgl aria-label="Dark mode"><span class=tr><span>☀</span><span>☾</span></span><span class=kn></span></label><a href="#" id=logout>Log out</a>
+<label class=tgl title="Light / dark"><input type=checkbox id=themetgl aria-label="Dark mode"><span class=tr><span>☀</span><span>☾</span></span><span class=kn></span></label><a href="/account">Account</a><a href="#" id=logout>Log out</a>
 <div class=pop id=thpop hidden>
 <label class=cap>☀ Sun (light) theme<select id=thl><option value=light>Light</option><option value=sepia>Sepia</option><option value=hc-light>High contrast light</option></select></label>
 <label class=cap>☾ Moon (dark) theme<select id=thd><option value=dark>Dark</option><option value=oled>OLED black</option><option value=hc-dark>High contrast dark</option></select></label>
@@ -2870,13 +2971,8 @@ ADMIN = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport
 <label class=cap>Starting password (8 or more characters)<input name=password type=password autocomplete=new-password minlength=8 required></label>
 <label class=cap>Role<select name=role><option value=viewer>viewer</option><option value=operator>operator</option><option value=admin>admin</option></select></label>
 <div class="full row"><span class=mut id=umsg></span><span class=sp></span><button class=p>Add user</button></div><div class="full err" id=uerr></div></form></div>
-<div class=card><b>Account</b> <span class=mut id=whoami></span>
-<form id=pf style="margin-top:8px">
-<label class=cap>Current password<input type=password name=current autocomplete=current-password required></label>
-<label class=cap>New password (8 or more characters)<input type=password name=new autocomplete=new-password minlength=8 required></label>
-<label class=cap>Repeat the new password<input type=password name=again autocomplete=new-password minlength=8 required></label>
-<div class="full row"><span class=mut id=pmsg></span><span class=sp></span><button class=p>Change password</button></div><div class="full err" id=perr></div></form>
-<div class=mut>Changing the password signs out every other browser. Lost it? Stop gitmirror, delete <code>configs/auth.json</code> in the data folder and start it again to create a new account.</div></div>
+<div class=card><b>Your account</b> <span class=mut id=whoami></span>
+<div class=mut style="margin-top:4px">Your password and your API keys are on <a href="/account">your account page</a>, which every user can open. Lost the admin password? Stop gitmirror, delete <code>configs/auth.json</code> in the data folder and start it again to create a new first admin.</div></div>
 <div class=card><b>Recent activity</b> <span class=mut>changes made by signed-in users and by the script token</span>
 <div class=scroll><table id=atab></table></div></div>
 <div class=card><b>Backup and restore the mirror list</b>
@@ -2893,16 +2989,18 @@ api('/auth/me').then(r=>r.json()).then(m=>{ME=m;if(m.user)document.querySelector
 const ago=t=>{const s=Date.now()/1e3-t;return s<90?Math.round(s)+'s ago':s<5400?Math.round(s/60)+'m ago':s<172800?Math.round(s/3600)+'h ago':Math.round(s/86400)+'d ago'};
 const esc2=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function loadUsers(){const us=await (await api('/users')).json();
- document.querySelector('#utab').innerHTML='<tr><th>User</th><th>Role</th><th>Status</th><th></th></tr>'+us.map(u=>{const me=ME&&u.name.toLowerCase()==(ME.user||'').toLowerCase();
+ document.querySelector('#utab').innerHTML='<tr><th>User</th><th>Role</th><th>Status</th><th>Keys</th><th></th></tr>'+us.map(u=>{const me=ME&&u.name.toLowerCase()==(ME.user||'').toLowerCase();
   return `<tr data-k="${esc2(u.key)}"><td>${esc2(u.name)}${me?' <span class=mut>(you)</span>':''}</td>
   <td><select data-f=role style="width:auto;margin:0">${['viewer','operator','admin'].map(r=>`<option ${r==u.role?'selected':''}>${r}</option>`).join('')}</select></td>
   <td>${u.disabled?'<span class=err>disabled</span>':'active'}${u.signed_in?` <span class=mut>${u.signed_in} signed in</span>`:''}</td>
+  <td>${u.keys||0}${u.keys?` <button data-a=rk>Revoke</button>`:''}</td>
   <td class=n>${me?'':`<button data-a=pw>Reset password</button> <button data-a=dis>${u.disabled?'Enable':'Disable'}</button> <button data-a=del>Delete</button>`}</td></tr>`}).join('');
  const au=await (await api('/audit')).json();
- document.querySelector('#atab').innerHTML='<tr><th>When</th><th>Who</th><th>What</th><th>On</th></tr>'+(au.slice(0,60).map(a=>`<tr><td class=n>${ago(a.t)}</td><td>${esc2(a.user)} <span class=mut>${esc2(a.role)}</span></td><td>${esc2(a.what)}${a.note?` <span class=mut>${esc2(a.note)}</span>`:''}</td><td>${esc2(a.target)}</td></tr>`).join('')||'<tr><td class=mut colspan=4>Nothing yet.</td></tr>')}
+ document.querySelector('#atab').innerHTML='<tr><th>When</th><th>Who</th><th>What</th><th>On</th></tr>'+(au.slice(0,60).map(a=>`<tr><td class=n>${ago(a.t)}</td><td>${esc2(a.user)} <span class=mut>${esc2(a.role)}${a.via?' via '+esc2(a.via):''}</span></td><td>${esc2(a.what)}${a.note?` <span class=mut>${esc2(a.note)}</span>`:''}</td><td>${esc2(a.target)}</td></tr>`).join('')||'<tr><td class=mut colspan=4>Nothing yet.</td></tr>')}
 document.querySelector('#utab').onchange=async e=>{const tr=e.target.closest('tr');if(!tr||e.target.dataset.f!='role')return;const r=await api('/users/'+encodeURIComponent(tr.dataset.k),{method:'PUT',body:JSON.stringify({role:e.target.value})});if(!r.ok)alert((await r.json()).error);loadUsers()};
 document.querySelector('#utab').onclick=async e=>{const b=e.target.closest('button'),tr=e.target.closest('tr');if(!b||!tr)return;const k=encodeURIComponent(tr.dataset.k),name=tr.firstElementChild.firstChild.textContent;let r;
  if(b.dataset.a=='pw'){const pw=prompt('New password for '+name+' (8 or more characters). They will be signed out everywhere.');if(!pw)return;r=await api('/users/'+k,{method:'PUT',body:JSON.stringify({password:pw})})}
+ else if(b.dataset.a=='rk'){if(!confirm('Revoke all API keys of '+name+'? Anything using them stops working.'))return;r=await api('/users/'+k,{method:'PUT',body:JSON.stringify({revoke_keys:true})})}
  else if(b.dataset.a=='dis'){r=await api('/users/'+k,{method:'PUT',body:JSON.stringify({disabled:b.textContent=='Disable'})})}
  else if(b.dataset.a=='del'){if(!confirm('Delete the user '+name+'?'))return;r=await api('/users/'+k,{method:'DELETE'})}
  if(r&&!r.ok)alert((await r.json()).error);loadUsers()};
@@ -2910,10 +3008,7 @@ document.querySelector('#uf').onsubmit=async ev=>{ev.preventDefault();const g=ev
  const r=await api('/users',{method:'POST',body:JSON.stringify({username:g.username.value,password:g.password.value,role:g.role.value})}),j=await r.json();
  if(r.ok){um.textContent='User added';ev.target.reset();loadUsers()}else ue.textContent=j.error};
 api('/version').then(r=>r.json()).then(v=>{document.querySelector('#verline').textContent='This is v'+v.version+(v.enabled&&v.latest?(v.update_available?'; v'+v.latest+' is available.':'; that is the newest release.'):'')});
-document.querySelector('#pf').onsubmit=async ev=>{ev.preventDefault();const g=ev.target.elements,pe=document.querySelector('#perr'),pm=document.querySelector('#pmsg');pe.textContent='';pm.textContent='';
- if(g.new.value!==g.again.value){pe.textContent='The two new passwords differ.';return}
- const r=await api('/auth/password',{method:'POST',body:JSON.stringify({current:g.current.value,new:g.new.value})}),j=await r.json();
- if(r.ok){pm.textContent='Password changed';ev.target.reset()}else pe.textContent=j.error};
+
 
 document.querySelector('#imp').onclick=async()=>{const f=document.querySelector('#impf').files[0],m=document.querySelector('#impmsg');if(!f){m.textContent='Choose an export file first.';return}
  let body;try{body=JSON.parse(await f.text())}catch(e){m.textContent='That file is not valid JSON.';return}
@@ -3269,6 +3364,53 @@ f.onsubmit=async ev=>{ev.preventDefault();e.textContent='';
  const j=await r.json();if(r.ok)location='/';else e.textContent=j.error||'Could not create the account'};
 </script></html>"""
 
+ACCOUNT = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Your account · Git Mirror</title>
+<style>__STYLE__</style>
+<main><div class=row><h1>Your account</h1><span class=sp></span><a href="/">All mirrors</a></div>
+<div class=card><b id=who>…</b> <span class=mut id=role></span></div>
+<div class=card><b>API keys</b> <span class=mut>For scripts and the browser extension. A key can do what you can, up to the access you pick, and you can revoke it at any time. Keys can't create other keys or change passwords.</span>
+<div id=newkey hidden style="border:1px solid var(--ok);border-radius:8px;padding:10px;margin:10px 0"><b>Your new key</b> <span class=mut>This is the only time it is shown. Copy it now.</span>
+<div class=row style="margin-top:6px"><code id=keytext style="word-break:break-all"></code><button id=copy>Copy</button></div></div>
+<div class=scroll><table id=ktab></table></div>
+<form id=kf style="margin-top:10px"><label class=cap>Name<input name=name maxlength=40 required placeholder="Chrome on my laptop" autocomplete=off></label>
+<label class=cap>Access<select name=role></select></label>
+<label class=cap>Expires<select name=days><option value=0>Never</option><option value=30>In 30 days</option><option value=90>In 90 days</option><option value=365>In 1 year</option></select></label>
+<div class="full row"><span class=mut id=kmsg></span><span class=sp></span><button class=p>Create key</button></div><div class="full err" id=kerr></div></form></div>
+<div class=card><b>Change password</b>
+<form id=pf style="margin-top:8px"><label class=cap>Current password<input type=password name=current autocomplete=current-password required></label>
+<label class=cap>New password (8 or more characters)<input type=password name=new autocomplete=new-password minlength=8 required></label>
+<label class=cap>Repeat the new password<input type=password name=again autocomplete=new-password minlength=8 required></label>
+<div class="full row"><span class=mut id=pmsg></span><span class=sp></span><button class=p>Change password</button></div><div class="full err" id=perr></div></form>
+<div class=mut>Changing your password signs you out of every other browser. Your API keys keep working.</div></div></main>
+<script>
+const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const api=(p,o={})=>fetch('/api'+p,{...o,headers:{'Content-Type':'application/json'}}).then(r=>{if(r.status==401)location='/login';return r});
+const ago=t=>{if(!t)return'never';const s=Date.now()/1e3-t;return s<90?'just now':s<5400?Math.round(s/60)+'m ago':s<172800?Math.round(s/3600)+'h ago':Math.round(s/86400)+'d ago'};
+const day=t=>new Date(t*1000).toLocaleDateString();
+const NAMES={viewer:'Read only',operator:'Operator'};let ME=null;
+async function load(){const keys=await (await api('/keys')).json();
+ $('#ktab').innerHTML=keys.length?'<tr><th>Name</th><th>Access</th><th>Created</th><th>Last used</th><th>Expires</th><th></th></tr>'+keys.map(k=>{const dead=k.expires&&k.expires<Date.now()/1e3;
+  return `<tr data-id="${esc(k.id)}"><td><b>${esc(k.name)}</b> <span class=mut>${esc(k.prefix)}…</span></td><td>${esc(NAMES[k.role]||k.role)}</td><td class=n>${day(k.created)}</td>
+  <td class=n>${k.last_used?esc(ago(k.last_used))+(k.last_ip?` <span class=mut>from ${esc(k.last_ip)}</span>`:''):'<span class=mut>never</span>'}</td>
+  <td class=n>${k.expires?(dead?'<span class=err>expired</span>':day(k.expires)):'never'}</td><td class=n><button>Revoke</button></td></tr>`}).join(''):'<tr><td class=mut>No keys yet.</td></tr>'}
+(async()=>{ME=await (await api('/auth/me')).json();$('#who').textContent=ME.user;$('#role').textContent='role: '+ME.role;
+ $('#kf').elements.role.innerHTML=['viewer','operator'].filter(r=>['viewer','operator','admin'].indexOf(r)<=['viewer','operator','admin'].indexOf(ME.role)).map(r=>`<option value=${r}>${NAMES[r]}</option>`).join('');
+ load()})();
+$('#kf').onsubmit=async e=>{e.preventDefault();const f=e.target.elements;$('#kerr').textContent='';
+ const r=await api('/keys',{method:'POST',body:JSON.stringify({name:f.name.value,role:f.role.value,expires_days:+f.days.value})}),j=await r.json();
+ if(!r.ok){$('#kerr').textContent=j.error;return}
+ $('#keytext').textContent=j.key;$('#newkey').hidden=false;e.target.reset();load()};
+$('#copy').onclick=async()=>{const t=$('#keytext').textContent;try{await navigator.clipboard.writeText(t);$('#copy').textContent='Copied'}catch(x){const r=document.createRange();r.selectNodeContents($('#keytext'));const s=getSelection();s.removeAllRanges();s.addRange(r);$('#copy').textContent='Press Ctrl+C'}};
+$('#ktab').onclick=async e=>{const b=e.target.closest('button'),tr=e.target.closest('tr');if(!b||!tr)return;
+ if(!confirm('Revoke this key? Anything using it stops working.'))return;
+ const r=await api('/keys/'+tr.dataset.id,{method:'DELETE'});if(!r.ok)alert((await r.json()).error);load()};
+$('#pf').onsubmit=async ev=>{ev.preventDefault();const g=ev.target.elements;$('#perr').textContent='';$('#pmsg').textContent='';
+ if(g.new.value!==g.again.value){$('#perr').textContent='The two new passwords differ.';return}
+ const r=await api('/auth/password',{method:'POST',body:JSON.stringify({current:g.current.value,new:g.new.value})}),j=await r.json();
+ if(r.ok){$('#pmsg').textContent='Password changed';ev.target.reset()}else $('#perr').textContent=j.error};
+</script></html>"""
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -3276,8 +3418,8 @@ def main():
     ap.add_argument("--port", type=int, default=int(os.environ.get("GITMIRROR_PORT", "8080")))
     ap.add_argument("--data", default=os.environ.get("GITMIRROR_DATA") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
     a = ap.parse_args()
-    global PAGE, ADMIN, REPO, MAINT, SOURCES, EVENTS, LOGIN, SETUP
-    PAGE, ADMIN, REPO, MAINT, SOURCES, EVENTS, LOGIN, SETUP = (x.replace("<style>__STYLE__</style>", THEME_JS + "<style>" + STYLE + "</style>") for x in (PAGE, ADMIN, REPO, MAINT, SOURCES, EVENTS, LOGIN, SETUP))
+    global PAGE, ADMIN, REPO, MAINT, SOURCES, EVENTS, LOGIN, SETUP, ACCOUNT
+    PAGE, ADMIN, REPO, MAINT, SOURCES, EVENTS, LOGIN, SETUP, ACCOUNT = (x.replace("<style>__STYLE__</style>", THEME_JS + "<style>" + STYLE + "</style>") for x in (PAGE, ADMIN, REPO, MAINT, SOURCES, EVENTS, LOGIN, SETUP, ACCOUNT))
     try:
         Handler.store = Store(a.data)
     except OSError as e:

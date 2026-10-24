@@ -4,10 +4,16 @@ All notable changes to gitmirror are listed here, newest first. Versions follow 
 
 ## [Unreleased]
 
+### Added
+
+- **Personal API keys** for scripts and the browser extension: each user can create several keys on the new **Account** page, with a name, an access level (read-only or operator, never admin) and an optional expiry. A key is shown once and stored only as a hash; the page lists when it was created, when and from which address it was last used, and when it expires, and revokes it with one click. A key follows its owner (demoted, disabled or deleted users take their keys with them), can't create keys or change passwords, and is named in the activity log. Admins see key counts and can revoke all of a user's keys.
+- An **Account** page for every user, with the change-password form (it used to be on the Admin page, which only admins can open).
+
 ### Changed
 
 - **Docker tags now mean something.** `latest` moves only when a *stable* release is tagged (`vX.Y.Z`); it no longer follows every commit or any pre-release. New tags: `edge` (newest commit on `main`), `beta` (newest pre-release) and `1` (newest of a major line), next to `1.2.3`, `1.2` and `sha-<commit>`.
 - The update badge only suggests stable releases to someone running a stable version.
+- Requests that carry only an `Authorization: Bearer` header skip the cross-site origin check, since another website can't add that header; a request that also has a sign-in cookie is still checked.
 
 ## [0.0.2-beta] - 2026-10-24
 
