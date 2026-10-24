@@ -1,0 +1,7 @@
+version: 2
+updates:
+  # keeps the python:3.13-slim base image in the Dockerfile current
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"

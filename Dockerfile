@@ -1,5 +1,9 @@
 FROM python:3.13-slim
 
+LABEL org.opencontainers.image.title="gitmirror" \
+      org.opencontainers.image.source="https://github.com/konetzed/gitmirror" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later"
+
 # git does the mirroring; git-lfs and openssh-client are for LFS objects and ssh:// remotes
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git git-lfs openssh-client ca-certificates tini \
@@ -8,7 +12,7 @@ RUN apt-get update \
  && git config --system safe.directory '*'
 
 RUN useradd --create-home --uid 1000 gitmirror && mkdir /data && chown gitmirror:gitmirror /data
-COPY gitmirror.py /app/gitmirror.py
+COPY gitmirror.py LICENSE /app/
 
 ENV GITMIRROR_DATA=/data \
     GITMIRROR_HOST=0.0.0.0 \

@@ -92,3 +92,9 @@ rest:
 - State-changing requests must be JSON and same-origin, which blocks cross-site form posts.
 - Forge detection and account listing make requests from the server to hosts you paste. That is fine on a private machine; keep the token set if the UI is reachable by others.
 - The release-download endpoint only serves files inside a mirror's own `extras/<id>/releases/` folder.
+
+## License
+
+gitmirror is free software under the **GNU General Public License v3.0 or later** (see [LICENSE](LICENSE)). You may use, study, change and share it; if you distribute a modified version, you must do so under the same license and make the source available.
+
+Found a security problem? See [SECURITY.md](SECURITY.md).
