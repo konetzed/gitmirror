@@ -28,7 +28,7 @@ import argparse, base64, hashlib, hmac, http.cookies, json, os, re, secrets, shu
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "0.0.1-beta"
+__version__ = "0.0.2-beta"
 REPO_URL = "https://github.com/konetzed/gitmirror"
 API_TOKEN = os.environ.get("GITMIRROR_TOKEN", "")  # optional: setup code for the first account, and a Bearer token for scripts
 ROLES = ("viewer", "operator", "admin")  # lowest to highest

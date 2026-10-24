@@ -3,7 +3,7 @@
 # two lines marked CHANGE.
 services:
   gitmirror:
-    image: ghcr.io/konetzed/gitmirror:0.0.1-beta   # a version tag: change it to update the app (:latest also exists, but TrueNAS won't re-pull it)
+    image: ghcr.io/konetzed/gitmirror:0.0.2-beta   # a version tag: change it to update the app (:latest also exists, but TrueNAS won't re-pull it)
     container_name: gitmirror
     user: "568:568"                            # TrueNAS's "apps" user: give it ownership of the dataset below
     restart: unless-stopped

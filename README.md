@@ -89,7 +89,7 @@ SCALE 24.10 and later run apps on Docker, so the published image works as a cust
 2. **Install the app:** **Apps**, **Discover Apps**, the three-dot menu at the top right, **Install via YAML**. Name it `gitmirror`, paste [`deploy/truenas-scale.yaml`](deploy/truenas-scale.yaml), and change the two lines marked `CHANGE`: the token and the dataset path. The wording of the menu varies slightly between releases. If you prefer the form instead, use image `ghcr.io/konetzed/gitmirror`, port `8080`, user and group `568`, the `GITMIRROR_TOKEN` variable, and a host-path volume from your dataset to `/data`.
 3. **Open it** at `http://<your-nas>:8080` and create your account: pick a username and password, and enter the `GITMIRROR_TOKEN` from the YAML as the setup code. The app card shows a health status from the image's built-in check.
    If the app stops right away and its log says it can't use its data directory, the dataset's owner isn't `apps` (uid 568) or it is read-only: fix the permissions and start it again.
-4. **Update it** by changing the image tag in the app's YAML (for example `:0.0.1-beta` to `:0.0.2-beta`) and saving. Pinning a version tag is more reliable than `latest`, because TrueNAS does not re-pull an unchanged tag.
+4. **Update it** by changing the image tag in the app's YAML (for example `:0.0.2-beta` to `:0.0.3-beta`) and saving. Pinning a version tag is more reliable than `latest`, because TrueNAS does not re-pull an unchanged tag.
 5. **Back it up** by snapshotting and replicating the dataset: it holds every mirror and all settings.
 
 Keep it on your LAN and keep `GITMIRROR_TOKEN` set (it stops a stranger on the network from creating the account before you do). To reach it from outside, put an HTTPS reverse proxy with its own login in front. Private repositories over SSH work too: put the key in the dataset (`ssh/id_ed25519`, mode 600, owned by the app user) and enable the `GIT_SSH_COMMAND` line in the YAML.
@@ -155,4 +155,4 @@ rest:
 
 gitmirror is free software under the **GNU General Public License v3.0 or later** (see [LICENSE](LICENSE)). You may use, study, change and share it; if you distribute a modified version, you must do so under the same license and make the source available.
 
-Found a security problem? See [SECURITY.md](SECURITY.md).
+What changed in each release: [CHANGELOG.md](CHANGELOG.md). Found a security problem? See [SECURITY.md](SECURITY.md).
