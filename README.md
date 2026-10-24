@@ -87,6 +87,7 @@ SCALE 24.10 and later run apps on Docker, so the published image works as a cust
 1. **Make a dataset** for gitmirror's data, for example `tank/apps/gitmirror`. Give the `apps` user (uid 568) ownership with read and write access (**Storage**, then the dataset's **Permissions**; the "Apps" ACL preset does this if your version offers it).
 2. **Install the app:** **Apps**, **Discover Apps**, the three-dot menu at the top right, **Install via YAML**. Name it `gitmirror`, paste [`deploy/truenas-scale.yaml`](deploy/truenas-scale.yaml), and change the two lines marked `CHANGE`: the token and the dataset path. The wording of the menu varies slightly between releases. If you prefer the form instead, use image `ghcr.io/konetzed/gitmirror`, port `8080`, user and group `568`, the `GITMIRROR_TOKEN` variable, and a host-path volume from your dataset to `/data`.
 3. **Open it** at `http://<your-nas>:8080/?token=<your token>`. The app card shows a health status from the image's built-in check.
+   If the app stops right away and its log says it can't use its data directory, the dataset's owner isn't `apps` (uid 568) or it is read-only: fix the permissions and start it again.
 4. **Update it** by changing the image tag in the app's YAML (for example `:1.0.0` to `:1.1.0`) and saving. Pinning a version tag is more reliable than `latest`, because TrueNAS does not re-pull an unchanged tag.
 5. **Back it up** by snapshotting and replicating the dataset: it holds every mirror and all settings.
 

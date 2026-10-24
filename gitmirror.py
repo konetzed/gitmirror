@@ -2689,7 +2689,12 @@ def main():
     a = ap.parse_args()
     global PAGE, ADMIN, REPO, MAINT, SOURCES, EVENTS
     PAGE, ADMIN, REPO, MAINT, SOURCES, EVENTS = (x.replace("<style>__STYLE__</style>", THEME_JS + "<style>" + STYLE + "</style>") for x in (PAGE, ADMIN, REPO, MAINT, SOURCES, EVENTS))
-    Handler.store = Store(a.data)
+    try:
+        Handler.store = Store(a.data)
+    except OSError as e:
+        sys.exit(f"gitmirror can't use its data directory ({e.filename or a.data}): {e.strerror}.\n"
+                 f"It is running as uid {os.getuid()}. The directory must exist and that user needs read and write access\n"
+                 f"(on TrueNAS: make the dataset owned by the app user, uid 568; in Docker: chown the folder to 1000).")
     threading.Thread(target=scheduler, args=(Handler.store,), daemon=True).start()
     if a.host not in ("127.0.0.1", "localhost", "::1") and not Handler.token:
         print("WARNING: listening on a non-loopback address without GITMIRROR_TOKEN; anyone who can reach it can add mirrors.")
