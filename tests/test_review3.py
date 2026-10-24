@@ -228,3 +228,64 @@ class FileRemoteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GithubTokenTestTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.make_account()
+        self.tok = self.login()
+        self.old = (gm.GITHUB_API, gm.ALLOW_LOCAL_HOSTS)
+        gm.ALLOW_LOCAL_HOSTS = True
+        _Tiny.seen = []
+        self.gh = serve()
+        gm.GITHUB_API = f"http://127.0.0.1:{self.gh.server_address[1]}"
+
+    def tearDown(self):
+        gm.GITHUB_API, gm.ALLOW_LOCAL_HOSTS = self.old
+        self.gh.shutdown()
+        super().tearDown()
+
+    def call(self, token=None):
+        body = {"token": token} if token is not None else {}
+        return self.req("POST", "/api/github/test", body, cookie=self.tok)
+
+    def test_a_working_token(self):
+        _Tiny.plan = {"/rate_limit": (200, {}, json.dumps({"resources": {"core": {"limit": 5000, "remaining": 4987, "reset": 1}}}).encode())}
+        code, _, j = self.call("ghp_typed")
+        self.assertEqual((code, j["ok"], j["token"]), (200, True, True))
+        self.assertIn("4987 of 5000", j["message"])
+        self.assertEqual(_Tiny.seen[-1][1].get("Authorization"), "Bearer ghp_typed")
+        self.assertNotIn("ghp_typed", json.dumps(j))
+
+    def test_a_rejected_token(self):
+        _Tiny.plan = {"/rate_limit": (401, {}, b'{"message":"Bad credentials"}')}
+        j = self.call("ghp_bad")[2]
+        self.assertEqual((j["ok"], j["token"]), (False, True))
+        self.assertIn("rejected", j["message"])
+
+    def test_no_token_reports_anonymous_limits(self):
+        _Tiny.plan = {"/rate_limit": (200, {}, json.dumps({"resources": {"core": {"limit": 60, "remaining": 58, "reset": 1}}}).encode())}
+        j = self.call()[2]
+        self.assertEqual((j["ok"], j["token"]), (True, False))
+        self.assertIsNone(_Tiny.seen[-1][1].get("Authorization"))
+
+    def test_the_saved_token_is_used_when_none_is_typed(self):
+        _Tiny.plan = {"/rate_limit": (200, {}, json.dumps({"resources": {"core": {"limit": 5000, "remaining": 5000, "reset": 1}}}).encode())}
+        self.store.settings["github_token"] = "ghp_saved"
+        gm.CFG.setdefault("_ref", self.store.settings)
+        try:
+            self.call()
+            self.assertEqual(_Tiny.seen[-1][1].get("Authorization"), "Bearer ghp_saved")
+        finally:
+            self.store.settings["github_token"] = ""
+
+    def test_github_being_unreachable_is_reported_not_raised(self):
+        self.gh.shutdown()
+        self.gh.server_close()  # close the listening socket too, or connections hang instead of being refused
+        j = self.call("x")[2]
+        self.assertFalse(j["ok"])
+        self.assertIn("Could not reach GitHub", j["message"])
+
+    def test_only_admins_may_run_it(self):
+        self.assertEqual(gm.required_role("POST", "/api/github/test", {}), "admin")

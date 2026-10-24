@@ -1056,6 +1056,34 @@ def api_json(url, timeout=15, with_headers=False):
         raise RuntimeError(str(e)[:150]) from None
 
 
+GITHUB_API = "https://api.github.com"
+
+
+def github_token_check(typed=""):
+    """Ask GitHub whether a token works (the rate-limit endpoint costs no quota). Uses the typed token if given, else the saved or
+    environment one. The token itself never leaves this function except in the request to api.github.com."""
+    tok = (typed or "").strip() or CFG.get("_ref", {}).get("github_token") or os.environ.get("GITMIRROR_GITHUB_TOKEN") or ""
+    h = {"User-Agent": "gitmirror", "Accept": "application/json"}
+    if tok:
+        h["Authorization"] = "Bearer " + tok
+    try:
+        r = open_url(GITHUB_API + "/rate_limit", h, 10, allow_private=False)
+        core = json.loads(r.read(1 << 20))["resources"]["core"]
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return {"ok": False, "token": True, "message": "GitHub rejected this token (bad credentials, or it has expired or been revoked)."}
+        return {"ok": False, "token": bool(tok), "message": f"GitHub answered HTTP {e.code}."}
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as e:
+        return {"ok": False, "token": bool(tok), "message": "Could not reach GitHub: " + str(e)[:120]}
+    when = time.strftime("%H:%M", time.localtime(core.get("reset", 0)))
+    left = f"{core.get('remaining')} of {core.get('limit')} requests left this hour (resets at {when})."
+    if not tok:
+        return {"ok": True, "token": False, "message": "No token is set; GitHub sees you as anonymous. " + left}
+    if core.get("limit", 0) <= 60:
+        return {"ok": False, "token": True, "message": "GitHub accepted the request but is not treating it as signed in. " + left}
+    return {"ok": True, "token": True, "message": "The token works. " + left}
+
+
 def refresh_meta(store, mid):
     with store.lock:
         m = store.get(mid)
@@ -1979,7 +2007,7 @@ def required_role(method, path, body=None):
     return "admin"  # DELETE and anything else: removing mirrors, sources or users
 
 
-AUDIT_SKIP = ("/api/auth/logout", "/api/version/check")
+AUDIT_SKIP = ("/api/auth/logout", "/api/version/check", "/api/github/test")
 
 
 def audit_target(store, path, body):
@@ -2520,6 +2548,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if method == "GET" and path == "/api/version":
             return self.send(200, version_out(st))
+        if method == "POST" and path == "/api/github/test":  # admin only (the default for unlisted POSTs)
+            t = body.get("token")
+            return self.send(200, github_token_check(t if isinstance(t, str) else ""))
         if method == "POST" and path == "/api/version/check":
             if version_out(st)["enabled"]:
                 check_update(st)
@@ -3196,7 +3227,7 @@ ADMIN = r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport
 <label class=cap>...but only if its LFS files total under (GB)<input name=lfs_auto_max_gb type=number min=0 required></label>
 <label class="cap full"><span class=row style="gap:8px"><input type=checkbox name=update_check style="width:auto"> Check GitHub for new gitmirror releases (a version tag lookup every few hours; nothing else is sent)</span><span class=mut id=verline></span></label>
 <label class=cap>Largest release file to download (MB, 0 = list only)<input name=release_asset_max_mb type=number min=0 required></label>
-<label class=cap>GitHub token <span class=mut id=tokstate></span><input name=github_token type=password autocomplete=off placeholder="leave blank to keep"><span class=mut>Lifts the 60 requests/hour limit. Needs no scopes for public data. Never shown again.</span></label>
+<label class=cap>GitHub token <span class=mut id=tokstate></span><input name=github_token type=password autocomplete=off placeholder="leave blank to keep"><span class=mut>Lifts the 60 requests/hour limit. Needs no scopes for public data. Never shown again.</span><span class=row style="gap:8px"><button type=button id=tokTest>Test token</button><span class=mut id=tokResult></span></span></label>
 <label class=cap>Sync timeout (seconds)<input name=timeout type=number min=10 max=86400 required></label>
 <div class="full row"><span class="mut" id=ok></span><span class=sp></span><button class=p>Save</button></div>
 <div class="full err" id=e></div></form></div>
@@ -3249,6 +3280,7 @@ document.querySelector('#imp').onclick=async()=>{const f=document.querySelector(
  let body;try{body=JSON.parse(await f.text())}catch(e){m.textContent='That file is not valid JSON.';return}
  const r=await api('/import',{method:'POST',body:JSON.stringify(body)}),j=await r.json();
  m.textContent=r.ok?`Added ${j.mirrors_added} mirrors (${j.mirrors_existing} already existed) and ${j.sources_added} followed accounts.${j.skipped.length?' Skipped: '+j.skipped.join('; '):''}`:j.error};
+document.querySelector('#tokTest').onclick=async()=>{const o=document.querySelector('#tokResult');o.textContent='Checking...';try{const r=await api('/github/test',{method:'POST',body:JSON.stringify({token:f.elements.github_token.value})}),j=await r.json();o.textContent=(r.ok?(j.ok?'\u2713 ':'\u2717 ')+j.message:j.error)+(f.elements.github_token.value?' (the typed token, not saved yet)':'')}catch(x){o.textContent='Could not run the test.'}};
 f.onsubmit=async e=>{e.preventDefault();const d=Object.fromEntries(new FormData(f));d.timeout=+d.timeout;d.max_parallel=+d.max_parallel;d.release_asset_max_mb=+d.release_asset_max_mb;d.update_check=f.elements.update_check.checked;d.lfs_auto=f.elements.lfs_auto.checked;d.lfs_auto_max_gb=+d.lfs_auto_max_gb;d.extras_default=[...document.querySelectorAll('[name=extras_default]:checked')].map(x=>x.value);if(!d.github_token)delete d.github_token;d.low_disk_gb=+d.low_disk_gb;d.hold_default=f.elements.hold_default.checked;d.colorblind=f.elements.colorblind.checked;
  const r=await api('/settings',{method:'PUT',body:JSON.stringify(d)}),j=await r.json();
  document.querySelector('#e').textContent=r.ok?'':j.error;document.querySelector('#ok').textContent=r.ok?'Saved':'';if(r.ok)show(j)};
