@@ -65,7 +65,7 @@ export GITMIRROR_TOKEN="$(openssl rand -hex 24)"   # note it down; it is the set
 mkdir -p data && sudo chown 1000:1000 data
 docker run -d --name gitmirror --restart unless-stopped \
   -p 127.0.0.1:8080:8080 -e GITMIRROR_TOKEN -v "$PWD/data:/data" \
-  ghcr.io/konetzed/gitmirror:0.1.0
+  ghcr.io/konetzed/gitmirror:0.1.1
 ```
 
 | Tag | What you get |
@@ -117,7 +117,7 @@ SCALE 24.10 and later run apps on Docker, so the published image works as a cust
 
 TrueNAS pulls an image once and does not re-pull an unchanged tag, and a plain container restart never pulls. Pick one:
 
-- **Pinned version (recommended):** change the tag in the app's YAML (for example `:0.1.0` to `:0.1.1`) and save. You choose when to upgrade.
+- **Pinned version (recommended):** change the tag in the app's YAML (for example `:0.1.1` to `:0.1.2`) and save. You choose when to upgrade.
 - **Follow `latest`:** use `image: ghcr.io/konetzed/gitmirror:latest` with `pull_policy: always` under the service. The image is fetched each time the app is *started* (stop, then start it, or save it again), so `latest` always means the newest stable release. Pre-releases never move `latest`.
 
 Either way, check the version badge in the page header afterwards. Before upgrading, snapshot the dataset: a newer version may migrate the data format, and an older gitmirror will not warn you about data it did not write.

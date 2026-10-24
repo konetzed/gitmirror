@@ -4,10 +4,23 @@ All notable changes to gitmirror are listed here, newest first. Versions follow 
 
 ## [Unreleased]
 
-- The GitHub token field now says "Token Set" (green) or "No Token Set" (red), with a tick or cross for colour-blind readers.
-- Admin has a **Test token** button for the GitHub token: it asks GitHub's rate-limit endpoint (no quota used) whether the saved or just-typed token works, and shows the requests left. The token is never sent back to the browser.
+## [0.1.1] - 2026-10-24
 
-- Docs: a contents line at the top of the README; the TrueNAS section now covers generating the setup code, using personal keys for scripts, and updating with a pinned tag or `pull_policy: always`.
+A small, friendly release: you can now check that your GitHub token works, the Admin page says plainly whether one is set, and the TrueNAS instructions are much fuller. No data format change and nothing to do when upgrading.
+
+### Added
+
+- **Test token** button in Admin. It asks GitHub's rate-limit endpoint (which costs no quota) whether the token is accepted and shows how many requests are left this hour, for example "The token works. 4987 of 5000 requests left (resets at 14:20)". It tests what you have typed before you save it, otherwise the saved token or `GITMIRROR_GITHUB_TOKEN`. Admins only; the token is never sent back to the browser or written to the audit log.
+- A contents line at the top of the README so you can jump to the right section.
+
+### Changed
+
+- The GitHub token field now reads **✓ Token Set** in green or **✗ No Token Set** in red, in your chosen theme's colours, with a tick or cross for colour-blind readers.
+- **TrueNAS SCALE docs:** generate a real setup code (`openssl rand -hex 24`) instead of leaving the placeholder, use personal API keys for scripts, and a new "Updating on TrueNAS" section. TrueNAS does not re-pull an unchanged tag and a restart never pulls, so either pin a version tag or use `:latest` with `pull_policy: always` (the YAML has the line ready to enable). Snapshot the dataset before upgrading.
+
+### Upgrading
+
+- Docker and TrueNAS: change the image tag to `0.1.1`, or restart a `latest` + `pull_policy: always` setup. The header badge should then say "v0.1.1 · up to date".
 
 ## [0.1.0] - 2026-10-24
 
@@ -110,7 +123,8 @@ First public release.
 - Light, dark, sepia, OLED and high-contrast themes with a colorblind-safe palette.
 - Docker image for amd64 and arm64 on `ghcr.io/konetzed/gitmirror`, a ready-made TrueNAS SCALE YAML, and GPL-3.0-or-later licensing.
 
-[Unreleased]: https://github.com/konetzed/gitmirror/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/konetzed/gitmirror/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/konetzed/gitmirror/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/konetzed/gitmirror/compare/v0.0.3-beta...v0.1.0
 [0.0.3-beta]: https://github.com/konetzed/gitmirror/compare/v0.0.2-beta...v0.0.3-beta
 [0.0.2-beta]: https://github.com/konetzed/gitmirror/compare/v0.0.1-beta...v0.0.2-beta

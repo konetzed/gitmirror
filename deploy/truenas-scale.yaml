@@ -3,7 +3,7 @@
 # two lines marked CHANGE.
 services:
   gitmirror:
-    image: ghcr.io/konetzed/gitmirror:0.1.0   # a version tag: change it to update the app (TrueNAS won't re-pull an unchanged tag)
+    image: ghcr.io/konetzed/gitmirror:0.1.1   # a version tag: change it to update the app (TrueNAS won't re-pull an unchanged tag)
     # To follow stable releases instead, use ":latest" and enable the next line; the image is then fetched whenever the app is started.
     # pull_policy: always
     container_name: gitmirror
