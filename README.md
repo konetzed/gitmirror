@@ -165,4 +165,4 @@ rest:
 
 gitmirror is free software under the **GNU General Public License v3.0 or later** (see [LICENSE](LICENSE)). You may use, study, change and share it; if you distribute a modified version, you must do so under the same license and make the source available.
 
-What changed in each release: [CHANGELOG.md](CHANGELOG.md). Found a security problem? See [SECURITY.md](SECURITY.md).
+What changed in each release: [CHANGELOG.md](CHANGELOG.md); how releases are cut and tagged: [RELEASING.md](RELEASING.md). Found a security problem? See [SECURITY.md](SECURITY.md).
