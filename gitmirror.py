@@ -54,12 +54,20 @@ def parse_interval(v):
         bad = ValueError("interval must look like 1W, 3D, 12H, 30M or 1D12H (0 = manual only)")
         if len(t) > 40:
             raise bad
-        if t.isdigit():
+        if t.isascii() and t.isdigit():
             mins = int(t)
         else:
-            if not re.fullmatch(r"(?:\d+[WDHM])+", t):  # unambiguous (digits, then one unit letter), so no backtracking blow-up
+            parts, num = [], ""  # read "<digits><unit>" pairs one character at a time: no regex, one pass
+            for ch in t:
+                if "0" <= ch <= "9":
+                    num += ch
+                elif ch in "WDHM" and num:
+                    parts.append((num, ch))
+                    num = ""
+                else:
+                    raise bad
+            if num or not parts:
                 raise bad
-            parts = re.findall(r"(\d+)([WDHM])", t)
             units = [u for _, u in parts]
             if units != sorted(set(units), key="WDHM".index):  # each unit at most once, in W D H M order
                 raise bad
