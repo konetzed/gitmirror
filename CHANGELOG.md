@@ -4,6 +4,10 @@ All notable changes to gitmirror are listed here, newest first. Versions follow 
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-24
+
+First stable release: the `latest` image tag now points at it. It rolls up the 0.0.3-beta review fixes below and the cleared code-scanning alerts.
+
 ### Upgrading
 
 - `file://` clone URLs can now be added only by admins, unless `GITMIRROR_ALLOW_FILE_REMOTES=1` extends that to operators. Mirrors that already use one keep syncing.
@@ -101,7 +105,8 @@ First public release.
 - Light, dark, sepia, OLED and high-contrast themes with a colorblind-safe palette.
 - Docker image for amd64 and arm64 on `ghcr.io/konetzed/gitmirror`, a ready-made TrueNAS SCALE YAML, and GPL-3.0-or-later licensing.
 
-[Unreleased]: https://github.com/konetzed/gitmirror/compare/v0.0.3-beta...HEAD
+[Unreleased]: https://github.com/konetzed/gitmirror/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/konetzed/gitmirror/compare/v0.0.3-beta...v0.1.0
 [0.0.3-beta]: https://github.com/konetzed/gitmirror/compare/v0.0.2-beta...v0.0.3-beta
 [0.0.2-beta]: https://github.com/konetzed/gitmirror/compare/v0.0.1-beta...v0.0.2-beta
 [0.0.1-beta]: https://github.com/konetzed/gitmirror/releases/tag/v0.0.1-beta
