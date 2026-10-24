@@ -23,7 +23,7 @@ The same options can be set with GITMIRROR_HOST, GITMIRROR_PORT and GITMIRROR_DA
 Send SIGHUP (kill -HUP <pid>) to re-exec with the latest code on disk.
 Set GITMIRROR_TOKEN to require "Authorization: Bearer <token>" (or ?token=) on every request.
 """
-import argparse, json, os, re, shutil, signal, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
+import argparse, hmac, json, os, re, shutil, signal, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -175,7 +175,10 @@ class Store:
 
 
 def mask(url):
-    return re.sub(r"(://[^/@:]+:)[^@/]+@", r"\1***@", url or "")
+    """Hide credentials in a clone URL: user:password@ keeps the user name, a bare token@ on http(s) is replaced
+    entirely. ssh:// user names such as git@ are not secrets and stay visible (they must survive an export)."""
+    url = re.sub(r"(://[^/@:]+:)[^@/]+@", r"\1***@", url or "")
+    return re.sub(r"(https?://)[^/@:]+@", r"\1***@", url)
 
 
 class GitError(RuntimeError):
@@ -290,6 +293,7 @@ def resolve_held(store, mid, accept):
                 else:
                     subprocess.run(["git", "update-ref", "-d", h["ref"]], cwd=repo, env=GIT_ENV, capture_output=True)
     finally:
+        size = mirror_size(store, mid)  # walks the repo: do it before taking the lock
         with store.lock:
             store.running.discard(mid)
             m = store.get(mid)
@@ -302,7 +306,7 @@ def resolve_held(store, mid, accept):
                 m["held"] = []
                 m.setdefault("events", []).append({"time": now, "type": "held_accepted" if accept else "held_rejected",
                                                    "alert": False, "summary": summary, "refs": held[:200]})
-                m["size"] = mirror_size(store, mid)
+                m["size"] = size
                 store.save()
     return len(held)
 
@@ -377,6 +381,7 @@ def sync(store, mid):
     except Exception as e:
         err = err or str(e)
     now = time.time()
+    size = mirror_size(store, mid)  # walks the whole repo tree: never do that while holding the lock
     with store.lock:
         m = store.get(mid)
         store.running.discard(mid)
@@ -435,7 +440,7 @@ def sync(store, mid):
                     m.pop("alert")
                 events.append({"time": now, "type": "origin_back", "alert": False, "summary": "Origin is reachable again."})
             del events[:-100]
-            m["size"] = mirror_size(store, mid)
+            m["size"] = size
             store.save()
     return True
 
@@ -457,11 +462,12 @@ def optimize_one(store, mid):
         pass
     after = dir_size(repo)
     saved = max(0, before - after)
+    size = mirror_size(store, mid)
     with store.lock:
         store.running.discard(mid)
         m = store.get(mid)
         if m:
-            m["size"] = mirror_size(store, mid)
+            m["size"] = size
             m["saved"] = m.get("saved", 0) + saved
             m["optimized_at"] = time.time()
         store.stats["saved_bytes"] += saved
@@ -989,6 +995,11 @@ def _s(x, n=500):
 
 def _i(x):
     return x if isinstance(x, int) and not isinstance(x, bool) else None
+
+
+def _http_url(x, n=300):
+    """An http(s) URL from untrusted API output, or None. Keeps javascript: and data: links out of the UI."""
+    return x[:n] if isinstance(x, str) and re.match(r"^https?://", x) else None
 
 
 def account_info(url):
@@ -1555,7 +1566,7 @@ def sync_issues(store, mid, src, log, prev):
                 "created": _s(d.get("created_at"), 40), "updated": _s(d.get("updated_at"), 40), "closed": _s(d.get("closed_at"), 40),
                 "body": _s(d.get("body") if kind != "gitlab" else d.get("description"), 100000),
                 "labels": [str((l.get("name") if isinstance(l, dict) else l))[:60] for l in (d.get("labels") or [])][:30],
-                "is_pr": bool(d.get("pull_request")), "url": _s(d.get("html_url") or d.get("web_url"), 300),
+                "is_pr": bool(d.get("pull_request")), "url": _http_url(d.get("html_url") or d.get("web_url"), 300),
                 "comments": old.get("comments", [])}
         ncom = 0
         if kind in ("github", "gitea"):
@@ -1638,6 +1649,7 @@ def check_url(u, label):
 
 
 class Handler(BaseHTTPRequestHandler):
+    timeout = 30  # seconds a client may stall mid-request before its connection is dropped
     store = None
     token = os.environ.get("GITMIRROR_TOKEN", "")
     server_version = "gitmirror"
@@ -1665,7 +1677,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self.token:
             return True
         q = parse_qs(urlparse(self.path).query)
-        return self.headers.get("Authorization") == f"Bearer {self.token}" or q.get("token") == [self.token]
+        given = (self.headers.get("Authorization") or "").removeprefix("Bearer ") if self.headers.get("Authorization", "").startswith("Bearer ") else (q.get("token") or [""])[0]
+        return hmac.compare_digest(given.encode(), self.token.encode())
 
     def route(self, method):
         if urlparse(self.path).path == "/healthz":  # for Docker / uptime checks, so it needs no token
@@ -1676,18 +1689,25 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path.rstrip("/") or "/"
         st = self.store
         if method != "GET":  # CSRF: browsers can't send JSON content-type cross-origin without preflight
-            if "application/json" not in self.headers.get("Content-Type", "") and int(self.headers.get("Content-Length") or 0):
+            if "application/json" not in self.headers.get("Content-Type", "") and (self.headers.get("Content-Length") or "0") != "0":
                 return self.send(415, {"error": "json only"})
             org = self.headers.get("Origin")
             if org and urlparse(org).netloc != self.headers.get("Host"):
                 return self.send(403, {"error": "bad origin"})
         body = {}
-        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return self.send(400, {"error": "bad content-length"})
+        if n < 0:
+            return self.send(400, {"error": "bad content-length"})
         if n:
             try:
                 body = json.loads(self.rfile.read(min(n, 1 << 20)))
             except ValueError:
                 return self.send(400, {"error": "bad json"})
+            if not isinstance(body, dict):
+                return self.send(400, {"error": "body must be a JSON object"})
 
         if method == "GET" and path == "/":
             return self.send(200, PAGE, "text/html")
@@ -2693,7 +2713,7 @@ def main():
         Handler.store = Store(a.data)
     except OSError as e:
         sys.exit(f"gitmirror can't use its data directory ({e.filename or a.data}): {e.strerror}.\n"
-                 f"It is running as uid {os.getuid()}. The directory must exist and that user needs read and write access\n"
+                 f"It is running as uid {os.getuid() if hasattr(os, 'getuid') else '?'}. The directory must exist and that user needs read and write access\n"
                  f"(on TrueNAS: make the dataset owned by the app user, uid 568; in Docker: chown the folder to 1000).")
     threading.Thread(target=scheduler, args=(Handler.store,), daemon=True).start()
     if a.host not in ("127.0.0.1", "localhost", "::1") and not Handler.token:
@@ -2725,8 +2745,9 @@ def main():
             reloading.set()
             threading.Thread(target=reload_self, daemon=True).start()
 
-    signal.signal(signal.SIGHUP, on_hup)
-    print(f"pid {os.getpid()}  (kill -HUP {os.getpid()} to reload code)", flush=True)
+    if hasattr(signal, "SIGHUP"):  # not on Windows; there you just restart the process
+        signal.signal(signal.SIGHUP, on_hup)
+        print(f"pid {os.getpid()}  (kill -HUP {os.getpid()} to reload code)", flush=True)
     httpd.serve_forever()
     while reloading.is_set():  # serve_forever returned because of shutdown(); let reload_self exec
         time.sleep(1)

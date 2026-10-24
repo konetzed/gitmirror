@@ -4,6 +4,7 @@ name: Docker image
 #   ghcr.io/konetzed/gitmirror:latest      the newest commit on main
 #   ghcr.io/konetzed/gitmirror:sha-<hash>  one tag per commit
 #   ghcr.io/konetzed/gitmirror:1.2.3       pushed when you create a tag such as v1.2.3
+# A test job compiles gitmirror.py and runs tests/ first; the image is only built when that passes.
 # Pull requests only test that the image builds.
 
 on:
@@ -21,7 +22,24 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Compile and run the unit tests (stdlib only; git is on the runner)
+        run: |
+          python -m py_compile gitmirror.py
+          python -m unittest discover -s tests -v
+
   image:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read

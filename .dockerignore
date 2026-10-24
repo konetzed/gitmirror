@@ -9,3 +9,4 @@ docker-compose.yml
 docs/
 deploy/
 .github/
+tests/

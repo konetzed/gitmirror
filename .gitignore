@@ -2,6 +2,7 @@
 data/
 mirror/
 __pycache__/
+.pytest_cache/
 *.pyc
 *.bak*
 .env
